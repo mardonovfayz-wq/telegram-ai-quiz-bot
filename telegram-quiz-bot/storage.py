@@ -44,6 +44,17 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS generation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_count INTEGER NOT NULL,
+                sections_total INTEGER NOT NULL,
+                sections_processed INTEGER NOT NULL,
+                question_count INTEGER NOT NULL,
+                duplicates_removed INTEGER NOT NULL DEFAULT 0,
+                unverified_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS questions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question TEXT NOT NULL,
@@ -53,6 +64,9 @@ def initialize_database() -> None:
                 source_reference TEXT NOT NULL,
                 source_quote TEXT NOT NULL,
                 source_ids_json TEXT NOT NULL,
+                source_verified INTEGER NOT NULL DEFAULT 1,
+                source_review_note TEXT NOT NULL DEFAULT '',
+                generation_run_id INTEGER REFERENCES generation_runs(id),
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -65,6 +79,25 @@ def initialize_database() -> None:
             );
             """
         )
+        question_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(questions)")
+        }
+        migrations = {
+            "source_verified": (
+                "ALTER TABLE questions ADD COLUMN source_verified "
+                "INTEGER NOT NULL DEFAULT 1"
+            ),
+            "source_review_note": (
+                "ALTER TABLE questions ADD COLUMN source_review_note "
+                "TEXT NOT NULL DEFAULT ''"
+            ),
+            "generation_run_id": (
+                "ALTER TABLE questions ADD COLUMN generation_run_id INTEGER"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in question_columns:
+                connection.execute(statement)
 
 
 def add_source(title: str, content: str) -> int:
@@ -106,6 +139,9 @@ def add_question(
     source_reference: str,
     source_quote: str,
     source_ids: list[int],
+    source_verified: bool = True,
+    source_review_note: str = "",
+    generation_run_id: int | None = None,
 ) -> int:
     now = _now()
     with _database() as connection:
@@ -114,8 +150,9 @@ def add_question(
             INSERT INTO questions (
                 question, options_json, correct_index, source_title,
                 source_reference, source_quote, source_ids_json, status,
+                source_verified, source_review_note, generation_run_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
             """,
             (
                 question,
@@ -125,6 +162,9 @@ def add_question(
                 source_reference,
                 source_quote,
                 json.dumps(source_ids),
+                int(source_verified),
+                source_review_note,
+                generation_run_id,
                 now,
                 now,
             ),
@@ -140,17 +180,22 @@ def get_question(question_id: int) -> dict[str, Any] | None:
     return _question_from_row(row) if row else None
 
 
-def list_questions(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def list_questions(
+    status: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     with _database() as connection:
         if status:
             rows = connection.execute(
                 "SELECT * FROM questions WHERE status = ? "
-                "ORDER BY id DESC LIMIT ?",
-                (status, limit),
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
-                "SELECT * FROM questions ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM questions ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
     return [_question_from_row(row) for row in rows]
 
@@ -159,16 +204,84 @@ def _question_from_row(row: sqlite3.Row) -> dict[str, Any]:
     question = dict(row)
     question["options"] = json.loads(question.pop("options_json"))
     question["source_ids"] = json.loads(question.pop("source_ids_json"))
+    question["source_verified"] = bool(question["source_verified"])
     return question
+
+
+def question_texts_for_dedupe(limit: int = 5000) -> list[str]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT question FROM questions ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [row["question"] for row in rows]
+
+
+def save_generation_collection(
+    source_count: int,
+    sections_total: int,
+    questions: list[dict[str, Any]],
+    duplicates_removed: int,
+) -> tuple[int, list[int]]:
+    """Atomically save a complete run and its draft questions."""
+    now = _now()
+    unverified_count = sum(not question["source_verified"] for question in questions)
+    with _database() as connection:
+        run_cursor = connection.execute(
+            """
+            INSERT INTO generation_runs (
+                source_count, sections_total, sections_processed,
+                question_count, duplicates_removed, unverified_count, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_count,
+                sections_total,
+                sections_total,
+                len(questions),
+                duplicates_removed,
+                unverified_count,
+                now,
+            ),
+        )
+        run_id = int(run_cursor.lastrowid)
+        question_ids = []
+        for question in questions:
+            cursor = connection.execute(
+                """
+                INSERT INTO questions (
+                    question, options_json, correct_index, source_title,
+                    source_reference, source_quote, source_ids_json,
+                    source_verified, source_review_note, generation_run_id,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    question["question"],
+                    json.dumps(question["options"], ensure_ascii=False),
+                    question["correct_index"],
+                    question["source_title"],
+                    question["source_reference"],
+                    question["source_quote"],
+                    json.dumps(question["source_ids"]),
+                    int(question["source_verified"]),
+                    question["source_review_note"],
+                    run_id,
+                    now,
+                    now,
+                ),
+            )
+            question_ids.append(int(cursor.lastrowid))
+    return run_id, question_ids
 
 
 def set_question_status(question_id: int, status: str) -> bool:
     if status not in {"approved", "rejected"}:
         raise ValueError("Unsupported question status.")
     with _database() as connection:
+        verification_clause = " AND source_verified = 1" if status == "approved" else ""
         cursor = connection.execute(
             "UPDATE questions SET status = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'pending'",
+            "WHERE id = ? AND status = 'pending'" + verification_clause,
             (status, _now(), question_id),
         )
         return cursor.rowcount == 1
@@ -182,6 +295,8 @@ def update_question(
     source_title: str,
     source_reference: str,
     source_quote: str,
+    source_verified: bool,
+    source_review_note: str,
 ) -> bool:
     with _database() as connection:
         cursor = connection.execute(
@@ -189,6 +304,7 @@ def update_question(
             UPDATE questions
             SET question = ?, options_json = ?, correct_index = ?,
                 source_title = ?, source_reference = ?, source_quote = ?,
+                source_verified = ?, source_review_note = ?,
                 updated_at = ?
             WHERE id = ? AND status = 'pending'
             """,
@@ -199,6 +315,8 @@ def update_question(
                 source_title,
                 source_reference,
                 source_quote,
+                int(source_verified),
+                source_review_note,
                 _now(),
                 question_id,
             ),
@@ -207,7 +325,7 @@ def update_question(
 
 
 def next_approved_question() -> dict[str, Any] | None:
-    with _connect() as connection:
+    with _database() as connection:
         row = connection.execute(
             "SELECT * FROM questions WHERE status = 'approved' "
             "ORDER BY id ASC LIMIT 1"
@@ -216,7 +334,7 @@ def next_approved_question() -> dict[str, Any] | None:
 
 
 def mark_question_published(question_id: int, message_id: int) -> bool:
-    with _connect() as connection:
+    with _database() as connection:
         cursor = connection.execute(
             "UPDATE questions SET status = 'published', published_message_id = ?, "
             "updated_at = ? WHERE id = ? AND status = 'approved'",
@@ -226,7 +344,7 @@ def mark_question_published(question_id: int, message_id: int) -> bool:
 
 
 def save_schedule(daily_times: list[str]) -> None:
-    with _connect() as connection:
+    with _database() as connection:
         connection.execute(
             "INSERT INTO settings (key, value) VALUES ('daily_times', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -235,7 +353,7 @@ def save_schedule(daily_times: list[str]) -> None:
 
 
 def get_schedule() -> list[str]:
-    with _connect() as connection:
+    with _database() as connection:
         row = connection.execute(
             "SELECT value FROM settings WHERE key = 'daily_times'"
         ).fetchone()

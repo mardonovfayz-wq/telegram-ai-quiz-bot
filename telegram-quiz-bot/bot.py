@@ -1,5 +1,6 @@
 """Telegram bot entry point. Configure all credentials with Replit Secrets."""
 
+import asyncio
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, PollType
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,10 +23,11 @@ from telegram.ext import (
 import storage
 from quiz_generator import (
     MAX_FILE_BYTES,
+    SectionProcessingError,
     extract_document,
     generate_questions,
     prepare_plain_text,
-    validate_grounding,
+    verify_grounding,
 )
 
 
@@ -50,14 +53,18 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+openai_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=45.0,
+    max_retries=0,
+)
 
 HELP_TEXT = (
     "Telegram AI Quiz Bot buyruqlari:\n"
     "/start — botni boshlash\n"
     "/upload — PDF, DOCX, TXT yoki oddiy matn yuborish rejimi\n"
     "/generate [son] — manbalardan savollar yaratish (standart: 5)\n"
-    "/questions [pending|approved|rejected|published] — savollarni ko‘rish\n"
+    "/questions [holat] [sahifa] — savollarni ko‘rish\n"
     "/schedule — nashr vaqtlarini ko‘rish yoki sozlash\n"
     "/help — yordam\n\n"
     "Yangi savollar avtomatik nashr qilinmaydi: har birini avval tasdiqlang."
@@ -215,31 +222,89 @@ async def generate_command(
 
     sources = storage.list_sources()
     progress = await update.effective_message.reply_text(
-        f"{count} ta savol manbalardan tayyorlanmoqda..."
+        "Manbalar bo‘limlarga ajratilmoqda. Hech bir bo‘lim tashlab ketilmaydi."
     )
+
+    async def show_progress(processed: int, total: int, draft_count: int) -> None:
+        if processed == 1 or processed % 5 == 0 or processed == total:
+            try:
+                await progress.edit_text(
+                    f"Bo‘limlar: {processed}/{total} qayta ishlandi. "
+                    f"Hozircha {draft_count} ta noyob savol tayyorlandi."
+                )
+            except TelegramError:
+                logger.info("Could not update Telegram generation progress.")
+
     try:
-        questions = await generate_questions(openai_client, sources, count)
-        for item in questions:
-            item["source_ids"] = [
-                source["id"]
-                for source in sources
-                if source["title"] == item["source_title"]
-            ]
-            question_id = storage.add_question(
-                question=item["question"],
-                options=item["options"],
-                correct_index=item["correct_index"],
-                source_title=item["source_title"],
-                source_reference=item["source_reference"],
-                source_quote=item["source_quote"],
-                source_ids=item["source_ids"],
+        result = await generate_questions(
+            openai_client,
+            sources,
+            count,
+            existing_question_texts=storage.question_texts_for_dedupe(),
+            progress_callback=show_progress,
+        )
+        questions = result["questions"]
+        run_id, question_ids = storage.save_generation_collection(
+            source_count=len(sources),
+            sections_total=result["sections_total"],
+            questions=questions,
+            duplicates_removed=result["duplicates_removed"],
+        )
+        delivery_failures = 0
+        for card_number, question_id in enumerate(question_ids, start=1):
+            try:
+                await send_question_card(
+                    update.effective_chat.id, context, question_id
+                )
+            except Exception as error:
+                delivery_failures += 1
+                logger.warning(
+                    "Could not send review card #%s: %s",
+                    question_id,
+                    type(error).__name__,
+                )
+            if card_number % 10 == 0:
+                try:
+                    await progress.edit_text(
+                        f"Bo‘limlar qayta ishlandi: "
+                        f"{result['sections_processed']}/{result['sections_total']}. "
+                        f"Ko‘rib chiqish kartalari yuborildi: "
+                        f"{card_number}/{len(question_ids)}."
+                    )
+                except TelegramError:
+                    logger.info("Could not update card-delivery progress.")
+        delivery_note = (
+            f"\nYuborilmagan kartalar: {delivery_failures}. "
+            "Ularni /questions pending orqali ko‘ring."
+            if delivery_failures
+            else ""
+        )
+        try:
+            await progress.edit_text(
+                f"To‘plam #{run_id} SQLite’da saqlandi.\n"
+                f"Bo‘limlar qayta ishlandi: "
+                f"{result['sections_processed']}/{result['sections_total']}\n"
+                f"Qoralama savollar: {len(questions)}\n"
+                f"Yetarli dalil topilmagan bo‘limlar: "
+                f"{result['sections_without_questions']}\n"
+                f"Takroriy savollar olib tashlandi: {result['duplicates_removed']}\n"
+                f"Manbasi tekshirilmagan qoralamalar: {result['source_unverified']}\n\n"
+                "Har bir savol administrator tomonidan tasdiqlanmaguncha "
+                f"kanalga chiqmaydi.{delivery_note}"
             )
-            await send_question_card(
-                update.effective_chat.id, context, question_id
-            )
+        except TelegramError:
+            logger.info("Could not send the final generation summary.")
+    except SectionProcessingError as error:
         await progress.edit_text(
-            f"{len(questions)} ta savol ko‘rib chiqish uchun tayyorlandi. "
-            "Ular tasdiqlanmaguncha kanalga chiqmaydi."
+            f"Qayta ishlash to‘xtadi: {error.sections_processed}/"
+            f"{error.sections_total} bo‘lim tugallandi; "
+            f"{error.section_number}-bo‘limda muammo yuz berdi.\n"
+            f"Oldin tayyorlangan savol nomzodlari: {error.drafts_found} "
+            "(to‘liq bo‘lmagan to‘plamda saqlanmadi).\n"
+            f"Xato: {error.reason}\n"
+            f"To‘liq bo‘lmagan to‘plam sifatida savollar saqlanmadi. "
+            "Hech bir bo‘lim jimgina tashlab ketilmadi; manbani tekshirib "
+            "qayta urinib ko‘ring."
         )
     except ValueError as error:
         await progress.edit_text(str(error))
@@ -257,12 +322,18 @@ def format_question(question: dict) -> str:
         f"{letters[index]}) {option}" for index, option in enumerate(question["options"])
     )
     correct = letters[question["correct_index"]]
+    verification_note = ""
+    if not question["source_verified"]:
+        verification_note = (
+            "\n\nOGOHLANTIRISH: MANBA TEKSHIRILMAGAN\n"
+            f"{question['source_review_note'] or 'Havola va iqtibosni tekshiring.'}"
+        )
     return (
         f"#{question['id']} · Holat: {question['status']}\n\n"
         f"{question['question']}\n\n{options}\n\n"
         f"To‘g‘ri javob: {correct}) {question['options'][question['correct_index']]}\n"
         f"Manba: {question['source_title']}, {question['source_reference']}\n"
-        f"Asos: {question['source_quote']}"
+        f"Asos: {question['source_quote']}{verification_note}"
     )
 
 
@@ -272,26 +343,44 @@ async def send_question_card(
     question = storage.get_question(question_id)
     if not question:
         return
-    keyboard = InlineKeyboardMarkup(
+    buttons = []
+    if question["source_verified"]:
+        buttons.append(
+            InlineKeyboardButton("Tasdiqlash", callback_data=f"approve:{question_id}")
+        )
+    buttons.extend(
         [
-            [
-                InlineKeyboardButton("Tasdiqlash", callback_data=f"approve:{question_id}"),
-                InlineKeyboardButton("Tahrirlash", callback_data=f"edit:{question_id}"),
-                InlineKeyboardButton("Rad etish", callback_data=f"reject:{question_id}"),
-            ]
+            InlineKeyboardButton("Tahrirlash", callback_data=f"edit:{question_id}"),
+            InlineKeyboardButton("Rad etish", callback_data=f"reject:{question_id}"),
         ]
     )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=format_question(question),
-        reply_markup=keyboard,
-    )
+    keyboard = InlineKeyboardMarkup([buttons])
+    for attempt in range(4):
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=format_question(question),
+                reply_markup=keyboard,
+            )
+            return
+        except RetryAfter as error:
+            if attempt == 3:
+                raise
+            delay = error.retry_after
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            await asyncio.sleep(min(max(float(delay), 1.0), 30.0) + 0.1)
 
 
 async def questions_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     if not await is_authorized_admin(update, context):
+        return
+    if len(context.args) > 2:
+        await update.effective_message.reply_text(
+            "Foydalanish: /questions [pending|approved|rejected|published] [sahifa]"
+        )
         return
     status = context.args[0].lower() if context.args else "pending"
     allowed = {"pending", "approved", "rejected", "published"}
@@ -300,14 +389,24 @@ async def questions_command(
             "Holat: pending, approved, rejected yoki published."
         )
         return
-    questions = storage.list_questions(status=status, limit=20)
+    try:
+        page = int(context.args[1]) if len(context.args) == 2 else 1
+    except ValueError:
+        await update.effective_message.reply_text("Sahifa raqamini kiriting.")
+        return
+    if page < 1:
+        await update.effective_message.reply_text("Sahifa raqami 1 yoki undan katta bo‘lsin.")
+        return
+    questions = storage.list_questions(
+        status=status, limit=20, offset=(page - 1) * 20
+    )
     if not questions:
         await update.effective_message.reply_text(
             f"'{status}' holatida savollar topilmadi."
         )
         return
     await update.effective_message.reply_text(
-        f"{status} holatidagi oxirgi {len(questions)} ta savol:"
+        f"{status} holatidagi {len(questions)} ta savol (sahifa {page}):"
     )
     for question in questions:
         if status == "pending":
@@ -324,19 +423,27 @@ async def question_action(
     query = update.callback_query
     if not await is_authorized_admin(update, context):
         return
-    await query.answer()
     match = re.fullmatch(r"(approve|edit|reject):(\d+)", query.data or "")
     if not match:
+        await query.answer()
         return
     action, raw_id = match.groups()
     question_id = int(raw_id)
     question = storage.get_question(question_id)
     if not question or question["status"] != "pending":
+        await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("Bu savol endi ko‘rib chiqilmayapti.")
         return
 
     if action == "approve":
+        if not question["source_verified"]:
+            await query.answer(
+                "Manba hali tekshirilmagan. Avval havola va iqtibosni tahrirlang.",
+                show_alert=True,
+            )
+            return
+        await query.answer()
         changed = storage.set_question_status(question_id, "approved")
         if changed:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -345,12 +452,14 @@ async def question_action(
             )
         return
     if action == "reject":
+        await query.answer()
         changed = storage.set_question_status(question_id, "rejected")
         if changed:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(f"#{question_id} rad etildi.")
         return
 
+    await query.answer()
     context.user_data["editing_question_id"] = question_id
     await query.message.reply_text(
         "Savolni quyidagi shaklda yuboring. A–D javoblari va to‘g‘ri javobni "
@@ -409,8 +518,8 @@ def parse_question_edit(text: str, old_question: dict) -> dict:
             part.strip() for part in fields["source"].split("|", 1)
         ]
     source_quote = fields.get("quote", old_question["source_quote"]).strip()
-    if not source_title or not source_reference or not source_quote:
-        raise ValueError("Manba, havola va iqtibos bo‘sh bo‘lmasligi kerak.")
+    if not source_title:
+        raise ValueError("Manba faylining nomini kiriting.")
     return {
         "question": question,
         "options": choices,
@@ -435,19 +544,28 @@ async def save_edited_question(
     try:
         edited = parse_question_edit(text, old_question)
         sources = storage.get_sources_by_ids(old_question["source_ids"])
-        validate_grounding(
+        verified, review_note = verify_grounding(
             edited["source_title"],
             edited["source_reference"],
             edited["source_quote"],
             sources,
         )
+        if len(edited["source_reference"]) > 190:
+            verified = False
+            review_note = "Havola juda uzun; qisqaroq aniq huquqiy havolani kiriting."
+        edited["source_verified"] = verified
+        edited["source_review_note"] = review_note
         updated = storage.update_question(question_id, **edited)
         if not updated:
             raise ValueError("Savol holati o‘zgargan; tahrir saqlanmadi.")
         context.user_data.pop("editing_question_id", None)
-        await update.effective_message.reply_text(
-            "Tahrir saqlandi. Savol hali tasdiqlanmagan:"
+        message = (
+            "Tahrir saqlandi. Manba tekshirildi; savol hali tasdiqlanmagan:"
+            if verified
+            else "Tahrir saqlandi, ammo manba hali tekshirilmagan. "
+            "Ushbu savol tasdiqlanmaydi. Havola yoki iqtibosni tuzating:"
         )
+        await update.effective_message.reply_text(message)
         await send_question_card(
             update.effective_chat.id, context, question_id
         )
@@ -549,9 +667,9 @@ async def publish_approved_question(
     if not question:
         logger.info("No approved questions are waiting to be published.")
         return
-    explanation = (
-        f"Manba: {question['source_title']}, {question['source_reference']}"
-    )
+    explanation = f"Manba: {question['source_title']}, {question['source_reference']}"
+    if len(explanation) > 200:
+        explanation = f"Manba: {question['source_reference']}"
     try:
         poll_message = await context.bot.send_poll(
             chat_id=CHANNEL_ID,
