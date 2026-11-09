@@ -1,45 +1,49 @@
-# [Project name]
+# Telegram AI Quiz Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A beginner-friendly Python Telegram bot that creates source-grounded Uzbek quiz questions, requires administrator approval, and publishes approved quizzes to a Telegram channel.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Start the `Telegram Quiz Bot` workflow to run `python3 telegram-quiz-bot/bot.py`.
+- Set `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` as Replit Secrets.
+- Set `ADMIN_ID` and `CHANNEL_ID` as Replit environment variables.
+- The bot creates and uses `telegram-quiz-bot/quiz_bot.sqlite3`.
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11
+- Telegram: `python-telegram-bot`
+- AI: OpenAI Python SDK
+- Persistence: SQLite
+- Document extraction: pypdf and python-docx
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `telegram-quiz-bot/bot.py` — commands, approvals, and scheduled channel polls
+- `telegram-quiz-bot/quiz_generator.py` — file reading and source-checked AI generation
+- `telegram-quiz-bot/storage.py` — SQLite operations
+- `telegram-quiz-bot/README.md` — setup and use instructions
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Generated questions stay pending until an administrator approves them.
+- Approval queues a question for the next configured schedule time; it does not publish immediately.
+- The bot verifies that each generated citation and supporting quote appear in the selected uploaded source.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Admins upload PDF, DOCX, TXT, or plain text, review generated Uzbek multiple-choice drafts, approve them, and configure daily Telegram Quiz Poll publication times.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Keep the bot project beginner-friendly and store its credentials outside source code.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Add the bot as a channel administrator with permission to post polls.
+- Schedule times use `Asia/Tashkent` unless the `TIMEZONE` environment variable overrides it.
+- A scheduled time with no approved question does not publish anything.
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- See `telegram-quiz-bot/README.md` for configuration and administrator commands.

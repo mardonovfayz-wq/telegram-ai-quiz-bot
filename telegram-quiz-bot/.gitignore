@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+quiz_bot.sqlite3
+quiz_bot.sqlite3-shm
+quiz_bot.sqlite3-wal
+.env

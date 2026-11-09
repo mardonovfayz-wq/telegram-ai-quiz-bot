@@ -1,0 +1,14 @@
+[project]
+name = "telegram-ai-quiz-bot"
+version = "0.1.0"
+description = "A source-grounded Uzbek Telegram quiz bot."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.60,<4",
+    "pypdf>=5.1,<8",
+    "python-docx>=1.1,<2",
+    "python-telegram-bot[job-queue]>=21.10,<23",
+]
+
+[tool.uv]
+package = false
