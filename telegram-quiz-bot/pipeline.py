@@ -57,6 +57,7 @@ async def run_incremental_generation(
     rng: random.Random | None = None,
     verify_answers: bool = True,
     section_chars: int = SECTION_CHARS,
+    actor: str = storage.SYSTEM_ACTOR,
 ) -> dict[str, Any]:
     """Create up to ``count`` drafts from the next unused sections and save them.
 
@@ -88,6 +89,7 @@ async def run_incremental_generation(
         duplicates_removed=result["duplicates_removed"],
         skipped_items=result["unsuitable_items"],
         section_outcomes=result["section_outcomes"],
+        actor=actor,
     )
     finished = sum(
         item["status"] != "failed" for item in result["section_outcomes"]

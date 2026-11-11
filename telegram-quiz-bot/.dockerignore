@@ -1,0 +1,17 @@
+# Never copy secrets, databases, uploads or tests into the image.
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.backup-*.sqlite3
+uploads/
+documents/
+temp/
+tmp/
+__pycache__/
+*.py[cod]
+tests/
+.venv/
+venv/

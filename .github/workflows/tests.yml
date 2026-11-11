@@ -56,3 +56,24 @@ jobs:
           ADMIN_ID: "1"
           CHANNEL_ID: "@offline_test_channel"
         run: python -m unittest discover -s telegram-quiz-bot/tests -v
+
+  docker-image:
+    # Checks that the server image builds. Nothing is pushed or deployed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (no push)
+        run: docker build --tag quiz-bot:ci telegram-quiz-bot
+      - name: Image contains no tests, databases or env files
+        run: |
+          set -eu
+          docker run --rm --entrypoint sh quiz-bot:ci -c \
+            'test ! -e /app/tests && ! ls /app/*.sqlite3 2>/dev/null && test ! -e /app/.env'
+      - name: Image refuses to start without configuration
+        run: |
+          set -eu
+          if docker run --rm quiz-bot:ci; then
+            echo "The bot started without a token; it must refuse." && exit 1
+          fi

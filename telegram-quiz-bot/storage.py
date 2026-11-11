@@ -69,6 +69,11 @@ _QUESTION_MIGRATIONS = {
     "legal_article": "TEXT NOT NULL DEFAULT ''",
     "legal_part": "TEXT NOT NULL DEFAULT ''",
     "legal_clause": "TEXT NOT NULL DEFAULT ''",
+    "approved_at": "TEXT",
+    "approved_by": "TEXT NOT NULL DEFAULT ''",
+    "publish_claimed_at": "TEXT",
+    "publish_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "last_publish_error": "TEXT NOT NULL DEFAULT ''",
 }
 _SOURCE_MIGRATIONS = {
     field: "TEXT NOT NULL DEFAULT ''" for field in SOURCE_METADATA_FIELDS
@@ -86,7 +91,39 @@ _EXPECTED_TABLES = {
     "skipped_items",
     "settings",
     "source_sections",
+    "audit_log",
+    "daily_runs",
 }
+
+# Question lifecycle. "publishing" means a poll may already be in the channel
+# (the send was started but its result is unknown); it is never retried
+# automatically, the administrator resolves it with /resolve.
+# "held" means an approved question was stopped before publishing because an
+# equivalent question is already published.
+QUESTION_STATUSES = ("pending", "approved", "rejected", "publishing", "published", "held")
+SYSTEM_ACTOR = "system"
+
+
+def _audit(
+    connection: sqlite3.Connection,
+    actor: str,
+    action: str,
+    question_id: int | None = None,
+    run_id: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    connection.execute(
+        "INSERT INTO audit_log (created_at, actor, action, question_id, run_id, details_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            _now(),
+            actor,
+            action,
+            question_id,
+            run_id,
+            json.dumps(details or {}, ensure_ascii=False),
+        ),
+    )
 
 
 def _pending_migrations(connection: sqlite3.Connection, tables: set[str]) -> list[str]:
@@ -211,7 +248,32 @@ def initialize_database() -> None:
                 quote_end INTEGER,
                 legal_article TEXT NOT NULL DEFAULT '',
                 legal_part TEXT NOT NULL DEFAULT '',
-                legal_clause TEXT NOT NULL DEFAULT ''
+                legal_clause TEXT NOT NULL DEFAULT '',
+                approved_at TEXT,
+                approved_by TEXT NOT NULL DEFAULT '',
+                publish_claimed_at TEXT,
+                publish_attempts INTEGER NOT NULL DEFAULT 0,
+                last_publish_error TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                question_id INTEGER,
+                run_id INTEGER,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_runs (
+                run_date TEXT PRIMARY KEY,
+                trigger TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                generation_run_id INTEGER,
+                details_json TEXT NOT NULL DEFAULT '{}'
             );
 
             CREATE TABLE IF NOT EXISTS skipped_items (
@@ -435,6 +497,7 @@ def save_generation_collection(
     mode: str = "full",
     failed_sections: int = 0,
     section_outcomes: list[dict[str, Any]] | None = None,
+    actor: str = SYSTEM_ACTOR,
 ) -> tuple[int, list[int]]:
     """Atomically save a run, its drafts, skipped Q&A pairs and ledger updates."""
     now = _now()
@@ -511,6 +574,14 @@ def save_generation_collection(
                 ),
             )
             question_ids.append(int(cursor.lastrowid))
+            _audit(
+                connection,
+                actor,
+                "generated",
+                question_id=question_ids[-1],
+                run_id=run_id,
+                details={"review_status": question.get("review_status", "NEEDS_REVIEW")},
+            )
         for item in skipped_items or []:
             connection.execute(
                 """
@@ -564,7 +635,13 @@ def list_skipped_items(generation_run_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def set_question_status(question_id: int, status: str) -> bool:
+def set_question_status(
+    question_id: int, status: str, actor: str = SYSTEM_ACTOR
+) -> bool:
+    """Approve or reject a pending draft; the change and its actor are audited.
+
+    Approval still requires a verified source and READY_FOR_APPROVAL.
+    """
     if status not in {"approved", "rejected"}:
         raise ValueError("Unsupported question status.")
     with _database() as connection:
@@ -573,12 +650,44 @@ def set_question_status(question_id: int, status: str) -> bool:
             if status == "approved"
             else ""
         )
+        now = _now()
+        approval_fields = ", approved_at = ?, approved_by = ?" if status == "approved" else ""
+        parameters: tuple = (status, now)
+        if status == "approved":
+            parameters += (now, actor)
         cursor = connection.execute(
-            "UPDATE questions SET status = ?, updated_at = ? "
-            "WHERE id = ? AND status = 'pending'" + verification_clause,
-            (status, _now(), question_id),
+            "UPDATE questions SET status = ?, updated_at = ?" + approval_fields
+            + " WHERE id = ? AND status = 'pending'" + verification_clause,
+            parameters + (question_id,),
         )
-        return cursor.rowcount == 1
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(connection, actor, status, question_id=question_id)
+        return changed
+
+
+def unapprove_question(question_id: int, actor: str, reason: str = "") -> bool:
+    """Move an approved or held question back to pending review (audited)."""
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT status FROM questions WHERE id = ?", (question_id,)
+        ).fetchone()
+        cursor = connection.execute(
+            "UPDATE questions SET status = 'pending', approved_at = NULL, "
+            "approved_by = '', updated_at = ? "
+            "WHERE id = ? AND status IN ('approved', 'held')",
+            (_now(), question_id),
+        )
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(
+                connection,
+                actor,
+                "unapproved",
+                question_id=question_id,
+                details={"from": row["status"], "reason": reason},
+            )
+        return changed
 
 
 def update_question(
@@ -597,9 +706,18 @@ def update_question(
     legal_article: str = "",
     legal_part: str = "",
     legal_clause: str = "",
+    actor: str = SYSTEM_ACTOR,
 ) -> bool:
-    """Update a pending draft. Original Q&A text and source links stay unchanged."""
+    """Update a pending draft. Original Q&A text and source links stay unchanged.
+
+    The audit log keeps the text before and after the edit.
+    """
     with _database() as connection:
+        before = connection.execute(
+            "SELECT question, options_json, correct_index, source_reference, "
+            "source_quote, review_status FROM questions WHERE id = ?",
+            (question_id,),
+        ).fetchone()
         cursor = connection.execute(
             """
             UPDATE questions
@@ -630,7 +748,33 @@ def update_question(
                 question_id,
             ),
         )
-        return cursor.rowcount == 1
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(
+                connection,
+                actor,
+                "edited",
+                question_id=question_id,
+                details={
+                    "before": {
+                        "question": before["question"],
+                        "options": json.loads(before["options_json"]),
+                        "correct_index": before["correct_index"],
+                        "source_reference": before["source_reference"],
+                        "source_quote": before["source_quote"],
+                        "review_status": before["review_status"],
+                    },
+                    "after": {
+                        "question": question,
+                        "options": options,
+                        "correct_index": correct_index,
+                        "source_reference": source_reference,
+                        "source_quote": source_quote,
+                        "review_status": review_status,
+                    },
+                },
+            )
+        return changed
 
 
 def next_approved_question() -> dict[str, Any] | None:
@@ -642,14 +786,243 @@ def next_approved_question() -> dict[str, Any] | None:
     return _question_from_row(row) if row else None
 
 
-def mark_question_published(question_id: int, message_id: int) -> bool:
+def published_question_texts() -> list[tuple[int, str]]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT id, question FROM questions WHERE status IN ('published', 'publishing')"
+        ).fetchall()
+    return [(int(row["id"]), row["question"]) for row in rows]
+
+
+def hold_question(question_id: int, reason: str, actor: str = SYSTEM_ACTOR) -> bool:
+    """Stop an approved question from being published (audited)."""
+    with _database() as connection:
+        cursor = connection.execute(
+            "UPDATE questions SET status = 'held', last_publish_error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'approved'",
+            (reason[:500], _now(), question_id),
+        )
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(connection, actor, "held", question_id=question_id, details={"reason": reason})
+        return changed
+
+
+def claim_for_publishing(question_id: int, actor: str = SYSTEM_ACTOR) -> bool:
+    """Atomically move one approved question to "publishing".
+
+    Only one caller can win the claim, so the same question can never be sent
+    twice, even if two publish jobs run at the same moment.
+    """
+    with _database() as connection:
+        cursor = connection.execute(
+            "UPDATE questions SET status = 'publishing', publish_claimed_at = ?, "
+            "publish_attempts = publish_attempts + 1, updated_at = ? "
+            "WHERE id = ? AND status = 'approved'",
+            (_now(), _now(), question_id),
+        )
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(connection, actor, "publish_started", question_id=question_id)
+        return changed
+
+
+def mark_question_published(
+    question_id: int, message_id: int, actor: str = SYSTEM_ACTOR
+) -> bool:
     with _database() as connection:
         cursor = connection.execute(
             "UPDATE questions SET status = 'published', published_message_id = ?, "
-            "updated_at = ? WHERE id = ? AND status = 'approved'",
+            "last_publish_error = '', updated_at = ? "
+            "WHERE id = ? AND status = 'publishing'",
             (message_id, _now(), question_id),
         )
-        return cursor.rowcount == 1
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(
+                connection,
+                actor,
+                "published",
+                question_id=question_id,
+                details={"message_id": message_id},
+            )
+        return changed
+
+
+def release_failed_publish(
+    question_id: int, error: str, actor: str = SYSTEM_ACTOR
+) -> bool:
+    """Telegram certainly did not post the poll: return it to the approved queue."""
+    with _database() as connection:
+        cursor = connection.execute(
+            "UPDATE questions SET status = 'approved', last_publish_error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'publishing'",
+            (error[:500], _now(), question_id),
+        )
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(
+                connection, actor, "publish_failed", question_id=question_id,
+                details={"error": error[:500]},
+            )
+        return changed
+
+
+def note_uncertain_publish(question_id: int, error: str, actor: str = SYSTEM_ACTOR) -> None:
+    """The send may or may not have reached Telegram; keep it in "publishing"."""
+    with _database() as connection:
+        connection.execute(
+            "UPDATE questions SET last_publish_error = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'publishing'",
+            (error[:500], _now(), question_id),
+        )
+        _audit(
+            connection, actor, "publish_uncertain", question_id=question_id,
+            details={"error": error[:500]},
+        )
+
+
+def resolve_publishing(
+    question_id: int,
+    outcome: str,
+    actor: str,
+    message_id: int | None = None,
+) -> bool:
+    """Administrator decision for a question stuck in "publishing".
+
+    ``outcome`` is "published" (it is in the channel) or "approved" (it is not;
+    put it back in the queue).
+    """
+    if outcome not in {"published", "approved"}:
+        raise ValueError("outcome must be 'published' or 'approved'")
+    with _database() as connection:
+        cursor = connection.execute(
+            "UPDATE questions SET status = ?, published_message_id = COALESCE(?, published_message_id), "
+            "updated_at = ? WHERE id = ? AND status = 'publishing'",
+            (outcome, message_id, _now(), question_id),
+        )
+        changed = cursor.rowcount == 1
+        if changed:
+            _audit(
+                connection, actor, f"resolved_{outcome}", question_id=question_id,
+                details={"message_id": message_id},
+            )
+        return changed
+
+
+def count_questions_by_status() -> dict[str, int]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT status, COUNT(*) AS amount FROM questions GROUP BY status"
+        ).fetchall()
+    counts = {status: 0 for status in QUESTION_STATUSES}
+    for row in rows:
+        counts[row["status"]] = row["amount"]
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Audit log, settings and daily runs.
+# ---------------------------------------------------------------------------
+
+
+def add_audit(
+    actor: str,
+    action: str,
+    question_id: int | None = None,
+    run_id: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    with _database() as connection:
+        _audit(connection, actor, action, question_id, run_id, details)
+
+
+def list_audit(limit: int = 20, question_id: int | None = None) -> list[dict[str, Any]]:
+    with _database() as connection:
+        if question_id is None:
+            rows = connection.execute(
+                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM audit_log WHERE question_id = ? ORDER BY id DESC LIMIT ?",
+                (question_id, limit),
+            ).fetchall()
+    entries = []
+    for row in rows:
+        entry = dict(row)
+        entry["details"] = json.loads(entry.pop("details_json") or "{}")
+        entries.append(entry)
+    return entries
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str, actor: str = SYSTEM_ACTOR) -> None:
+    with _database() as connection:
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        _audit(connection, actor, "setting_changed", details={"key": key, "value": value})
+
+
+def start_daily_run(run_date: str, trigger: str) -> bool:
+    """Reserve the daily generation for ``run_date``; False if already taken.
+
+    This makes the 09:00 run happen at most once per day, even if the bot's
+    own scheduler and Activepieces both fire, or the bot restarts.
+    """
+    with _database() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO daily_runs (run_date, trigger, status, started_at) "
+            "VALUES (?, ?, 'running', ?)",
+            (run_date, trigger, _now()),
+        )
+        taken = cursor.rowcount == 1
+        if taken:
+            _audit(
+                connection, trigger, "daily_generation_started",
+                details={"run_date": run_date},
+            )
+        return taken
+
+
+def finish_daily_run(
+    run_date: str,
+    status: str,
+    generation_run_id: int | None,
+    details: dict[str, Any],
+) -> None:
+    with _database() as connection:
+        connection.execute(
+            "UPDATE daily_runs SET status = ?, finished_at = ?, generation_run_id = ?, "
+            "details_json = ? WHERE run_date = ?",
+            (status, _now(), generation_run_id, json.dumps(details, ensure_ascii=False), run_date),
+        )
+        _audit(
+            connection, SYSTEM_ACTOR, f"daily_generation_{status}",
+            run_id=generation_run_id, details={"run_date": run_date, **details},
+        )
+
+
+def get_daily_run(run_date: str) -> dict[str, Any] | None:
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM daily_runs WHERE run_date = ?", (run_date,)
+        ).fetchone()
+    if not row:
+        return None
+    entry = dict(row)
+    entry["details"] = json.loads(entry.pop("details_json") or "{}")
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +1091,7 @@ def save_incremental_run(
     duplicates_removed: int,
     skipped_items: list[dict[str, Any]],
     section_outcomes: list[dict[str, Any]],
+    actor: str = SYSTEM_ACTOR,
 ) -> tuple[int, list[int]]:
     """Atomically save drafts, skipped pairs and ledger updates for one run.
 
@@ -734,6 +1108,7 @@ def save_incremental_run(
         mode="incremental",
         failed_sections=failed,
         section_outcomes=section_outcomes,
+        actor=actor,
     )
     return run_id, question_ids
 

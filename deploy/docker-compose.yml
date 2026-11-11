@@ -1,0 +1,41 @@
+# Example stack for running the bot next to Activepieces on the same server.
+# Use it from a web panel (Portainer / Coolify / Dokploy "stack from Git
+# repository"). Do NOT start it while the Replit bot is still running with the
+# same Telegram token: two bots would both poll Telegram and both publish.
+services:
+  quiz-bot:
+    build:
+      context: ../telegram-quiz-bot
+    container_name: quiz-bot
+    restart: unless-stopped
+    # Put real values in the panel's "Environment variables" form (or an env
+    # file stored only on the server). See quiz-bot.env.example for the list.
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ADMIN_ID: ${ADMIN_ID}
+      CHANNEL_ID: ${CHANNEL_ID}
+      TIMEZONE: ${TIMEZONE:-Asia/Tashkent}
+      DAILY_GENERATION_TIME: ${DAILY_GENERATION_TIME:-09:00}
+      HOOK_TOKEN: ${HOOK_TOKEN:-}
+    volumes:
+      - quiz-bot-data:/data          # SQLite database + automatic backups
+    networks:
+      - activepieces                 # lets Activepieces call http://quiz-bot:8080
+    # No "ports:" section on purpose: the hook is reachable only from
+    # containers on the same Docker network, not from the internet.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  quiz-bot-data:
+
+networks:
+  activepieces:
+    external: true
+    # Replace with the name of your Activepieces Docker network
+    # (shown in the panel's "Networks" page).
+    name: ${ACTIVEPIECES_NETWORK:-activepieces_default}

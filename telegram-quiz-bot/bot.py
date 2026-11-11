@@ -8,7 +8,8 @@ import asyncio
 import logging
 import os
 import re
-from datetime import time
+from datetime import datetime, time
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
@@ -24,8 +25,12 @@ from telegram.ext import (
     filters,
 )
 
+import daily
 import pipeline
+import publishing
 import storage
+from hook import start_hook_server
+from notify import AdminNotifier
 from bot_helpers import (
     build_poll_explanation,
     format_metadata,
@@ -63,6 +68,13 @@ OPENAI_API_KEY = required_environment("OPENAI_API_KEY")
 ADMIN_ID = parse_admin_id(required_environment("ADMIN_ID"))
 CHANNEL_ID = parse_channel_id(required_environment("CHANNEL_ID"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
+# Daily draft generation time (local TIMEZONE). The generation itself is off
+# until the administrator runs /autogen on.
+DAILY_GENERATION_TIME = os.getenv("DAILY_GENERATION_TIME", "09:00").strip()
+# Optional HTTP hook for Activepieces; disabled unless HOOK_TOKEN is set.
+HOOK_TOKEN = os.getenv("HOOK_TOKEN", "").strip()
+HOOK_HOST = os.getenv("HOOK_HOST", "127.0.0.1").strip()
+HOOK_PORT = int(os.getenv("HOOK_PORT", "8080") or 8080)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -89,6 +101,11 @@ HELP_TEXT = (
     "/sources — manbalar ro‘yxati va huquqiy hujjat ma’lumotlari\n"
     "/setmeta <ID> — manbaga rasmiy nom, raqam, sana va havola kiritish\n"
     "/schedule — nashr vaqtlarini ko‘rish yoki sozlash\n"
+    "/autogen — kunlik 09:00 generatsiya: holat, on, off, run, trigger\n"
+    "/queue — nashr navbati holati\n"
+    "/audit [son] yoki /audit #ID — audit jurnali\n"
+    "/unapprove <ID> — tasdiqni bekor qilib, qayta ko‘rib chiqishga qaytarish\n"
+    "/resolve <ID> published|approved — holati noma’lum nashrni hal qilish\n"
     "/help — yordam\n\n"
     "Yangi savollar avtomatik nashr qilinmaydi: har birini avval tasdiqlang."
 )
@@ -697,11 +714,11 @@ async def questions_command(
         return
     if len(context.args) > 2:
         await update.effective_message.reply_text(
-            "Foydalanish: /questions [pending|approved|rejected|published] [sahifa]"
+            "Foydalanish: /questions [pending|approved|rejected|publishing|published|held] [sahifa]"
         )
         return
     status = context.args[0].lower() if context.args else "pending"
-    allowed = {"pending", "approved", "rejected", "published"}
+    allowed = set(storage.QUESTION_STATUSES)
     if status not in allowed:
         await update.effective_message.reply_text(
             "Holat: pending, approved, rejected yoki published."
@@ -765,7 +782,9 @@ async def question_action(
             )
             return
         await query.answer()
-        changed = storage.set_question_status(question_id, "approved")
+        changed = storage.set_question_status(
+            question_id, "approved", actor=admin_actor(update)
+        )
         if changed:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(
@@ -774,7 +793,9 @@ async def question_action(
         return
     if action == "reject":
         await query.answer()
-        changed = storage.set_question_status(question_id, "rejected")
+        changed = storage.set_question_status(
+            question_id, "rejected", actor=admin_actor(update)
+        )
         if changed:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text(f"#{question_id} rad etildi.")
@@ -842,7 +863,9 @@ async def save_edited_question(
         edited["review_status"] = (
             "READY_FOR_APPROVAL" if verified else "NEEDS_REVIEW"
         )
-        updated = storage.update_question(question_id, **edited)
+        updated = storage.update_question(
+            question_id, **edited, actor=admin_actor(update)
+        )
         if not updated:
             raise ValueError("Savol holati o‘zgargan; tahrir saqlanmadi.")
         context.user_data.pop("editing_question_id", None)
@@ -922,17 +945,42 @@ async def schedule_command(
     )
 
 
+def admin_actor(update: Update) -> str:
+    user = update.effective_user
+    return f"admin:{user.id}" if user else "admin"
+
+
+def today_string() -> str:
+    return datetime.now(TIMEZONE).date().isoformat()
+
+
+def get_notifier(application: Application) -> AdminNotifier:
+    notifier = application.bot_data.get("notifier")
+    if notifier is None:
+
+        async def send(text: str) -> None:
+            await application.bot.send_message(chat_id=ADMIN_ID, text=text)
+
+        notifier = AdminNotifier(send)
+        application.bot_data["notifier"] = notifier
+    return notifier
+
+
+def generation_lock(application: Application) -> asyncio.Lock:
+    return application.bot_data.setdefault("generation_lock", asyncio.Lock())
+
+
 async def publish_approved_question(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    question = storage.next_approved_question()
-    if not question:
-        logger.info("No approved questions are waiting to be published.")
-        return
-    sources = storage.get_sources_by_ids(question.get("source_ids") or [])
-    explanation = build_poll_explanation(question, sources[0] if sources else None)
-    try:
-        poll_message = await context.bot.send_poll(
+    """Scheduled slot: publish one approved question, never the same one twice."""
+    lock = context.application.bot_data.setdefault("publish_lock", asyncio.Lock())
+    notifier = get_notifier(context.application)
+
+    async def send_poll(question: dict) -> int:
+        sources = storage.get_sources_by_ids(question.get("source_ids") or [])
+        explanation = build_poll_explanation(question, sources[0] if sources else None)
+        message = await context.bot.send_poll(
             chat_id=CHANNEL_ID,
             question=question["question"],
             options=question["options"],
@@ -941,23 +989,248 @@ async def publish_approved_question(
             explanation=explanation,
             is_anonymous=True,
         )
-        storage.mark_question_published(question["id"], poll_message.message_id)
-        logger.info("Published approved question #%s.", question["id"])
-    except Exception as error:
-        logger.warning(
-            "Could not publish approved question #%s: %s",
-            question["id"],
-            type(error).__name__,
+        return message.message_id
+
+    async with lock:
+        outcome = await publishing.publish_next(
+            send_poll, notifier.notify, actor="scheduler", today=today_string()
+        )
+    logger.info("Publish slot finished: %s", outcome["status"])
+
+
+async def run_daily(
+    application: Application, trigger: str, manual: bool = False, actor: str | None = None
+) -> dict:
+    """Daily generation (scheduled, Activepieces or manual) with notifications."""
+    lock = generation_lock(application)
+    notifier = get_notifier(application)
+    if lock.locked():
+        if manual or trigger == "activepieces":
+            await notifier.notify("Generatsiya allaqachon ishlayapti; yangi ishga tushirilmadi.")
+        return {"status": "busy"}
+    async with lock:
+        outcome = await daily.run_daily_generation(
+            openai_client, trigger, today_string(), manual=manual, actor=actor
+        )
+    if outcome["status"] in {"disabled", "other_trigger"} and not manual:
+        logger.info("Daily generation skipped: %s", outcome["status"])
+        return outcome
+    result = outcome.get("result") or {}
+    if result.get("question_ids"):
+        holder = SimpleNamespace(bot=application.bot)
+        for question_id in result["question_ids"]:
+            try:
+                await send_question_card(ADMIN_ID, holder, question_id)
+            except Exception as error:
+                logger.warning("Could not send review card: %s", type(error).__name__)
+    heading = "Qo‘lda ishga tushirilgan generatsiya" if manual else "Kunlik generatsiya (09:00)"
+    await notifier.notify(daily.daily_summary_text(outcome, heading))
+    for warning in daily.queue_warnings(len(storage.get_schedule())):
+        await notifier.notify(warning, key=f"queue:{warning[:40]}:{today_string()}")
+    return outcome
+
+
+async def daily_generation_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_daily(context.application, "internal")
+
+
+def _parse_hhmm(text: str) -> tuple[int, int]:
+    hour, minute = (int(part) for part in text.split(":"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(text)
+    return hour, minute
+
+
+async def autogen_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    actor = admin_actor(update)
+    action = context.args[0].lower() if context.args else "status"
+    if action == "on":
+        daily.set_enabled(True, actor)
+    elif action == "off":
+        daily.set_enabled(False, actor)
+    elif action == "trigger":
+        try:
+            daily.set_trigger(context.args[1].lower() if len(context.args) > 1 else "", actor)
+        except ValueError as error:
+            await update.effective_message.reply_text(str(error))
+            return
+    elif action == "run":
+        context.application.create_task(
+            run_daily(context.application, "manual", manual=True, actor=actor)
+        )
+        await update.effective_message.reply_text(
+            "10 ta qoralama tayyorlash boshlandi (qo‘lda sinov). Natija shu chatga keladi; "
+            "hech narsa avtomatik e’lon qilinmaydi."
+        )
+        return
+    elif action != "status":
+        await update.effective_message.reply_text(
+            "Foydalanish: /autogen [status|on|off|run|trigger internal|trigger activepieces]"
+        )
+        return
+    settings = daily.automation_settings()
+    today = storage.get_daily_run(today_string())
+    today_line = (
+        f"Bugungi ishga tushirish: {today['status']} ({today['trigger']})"
+        if today
+        else "Bugun hali ishga tushirilmagan."
+    )
+    await update.effective_message.reply_text(
+        f"Kunlik generatsiya: {'YOQILGAN' if settings['enabled'] else 'o‘chiq'}\n"
+        f"Vaqt: har kuni {DAILY_GENERATION_TIME} ({TIMEZONE.key}), {daily.DAILY_TARGET} ta qoralama\n"
+        f"Ishga tushiruvchi: {settings['trigger']} "
+        f"({'bot ichidagi jadval' if settings['trigger'] == 'internal' else 'Activepieces HTTP hook'})\n"
+        f"HTTP hook: {'sozlangan' if HOOK_TOKEN else 'o‘chiq (HOOK_TOKEN yo‘q)'}\n"
+        f"{today_line}\n\n"
+        "Qoralamalar faqat sizning tasdig‘ingizdan keyin kanalga chiqadi."
+    )
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    counts = storage.count_questions_by_status()
+    lines = [f"{status}: {amount}" for status, amount in counts.items()]
+    stuck = storage.list_questions("publishing", limit=10)
+    if stuck:
+        lines.append(
+            "Holati noma’lum: "
+            + ", ".join(f"#{item['id']} ({item['last_publish_error'] or '—'})" for item in stuck)
+        )
+    warnings = daily.queue_warnings(len(storage.get_schedule()))
+    text = "Savollar holati:\n" + "\n".join(lines)
+    if warnings:
+        text += "\n\nOgohlantirishlar:\n" + "\n".join(f"• {item}" for item in warnings)
+    await update.effective_message.reply_text(_fit_message(text))
+
+
+async def audit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    question_id = None
+    limit = 15
+    if context.args:
+        argument = context.args[0]
+        if argument.startswith("#") and argument[1:].isdigit():
+            question_id = int(argument[1:])
+            limit = 30
+        elif argument.isdigit():
+            limit = min(int(argument), 50)
+        else:
+            await update.effective_message.reply_text("Foydalanish: /audit [son] yoki /audit #ID")
+            return
+    entries = storage.list_audit(limit=limit, question_id=question_id)
+    if not entries:
+        await update.effective_message.reply_text("Audit jurnalida yozuv yo‘q.")
+        return
+    lines = []
+    for entry in entries:
+        target = f" #{entry['question_id']}" if entry["question_id"] else ""
+        extra = ""
+        details = entry["details"]
+        if details.get("message_id"):
+            extra = f" (xabar {details['message_id']})"
+        elif details.get("reason"):
+            extra = f" ({str(details['reason'])[:80]})"
+        elif details.get("key"):
+            extra = f" ({details['key']}={details.get('value')})"
+        lines.append(f"{entry['created_at'][:19]} · {entry['actor']} · {entry['action']}{target}{extra}")
+    await update.effective_message.reply_text(_fit_message("Audit jurnali:\n" + "\n".join(lines)))
+
+
+async def unapprove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    if len(context.args) < 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Foydalanish: /unapprove <ID> [sabab]")
+        return
+    question_id = int(context.args[0])
+    reason = " ".join(context.args[1:])
+    if storage.unapprove_question(question_id, admin_actor(update), reason):
+        await update.effective_message.reply_text(
+            f"#{question_id} qayta ko‘rib chiqishga (pending) qaytarildi."
+        )
+        await send_question_card(update.effective_chat.id, context, question_id)
+    else:
+        await update.effective_message.reply_text(
+            "Faqat 'approved' yoki 'held' holatidagi savolni qaytarish mumkin."
         )
 
 
+async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    args = context.args
+    if len(args) < 2 or not args[0].isdigit() or args[1] not in {"published", "approved"}:
+        await update.effective_message.reply_text(
+            "Foydalanish: /resolve <ID> published [xabar_ID] yoki /resolve <ID> approved\n"
+            "published — savol kanalda chiqqan; approved — chiqmagan, navbatga qaytarish."
+        )
+        return
+    message_id = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+    if storage.resolve_publishing(int(args[0]), args[1], admin_actor(update), message_id):
+        await update.effective_message.reply_text(f"#{args[0]} holati: {args[1]}.")
+    else:
+        await update.effective_message.reply_text(
+            "Bu savol 'publishing' holatida emas; hech narsa o‘zgarmadi."
+        )
+
+
+async def _handle_daily_hook() -> dict:
+    """Called by the HTTP hook (Activepieces). Starts the run in the background."""
+    application = _APPLICATION_REF["app"]
+    settings = daily.automation_settings()
+    if not settings["enabled"]:
+        return {"accepted": False, "reason": "disabled"}
+    if settings["trigger"] != "activepieces":
+        return {"accepted": False, "reason": "trigger_is_internal"}
+    if storage.get_daily_run(today_string()):
+        return {"accepted": False, "reason": "already_ran_today"}
+    if generation_lock(application).locked():
+        return {"accepted": False, "reason": "busy"}
+    application.create_task(run_daily(application, "activepieces"))
+    return {"accepted": True}
+
+
+_APPLICATION_REF: dict = {}
+
+
 async def startup(application: Application) -> None:
+    _APPLICATION_REF["app"] = application
     times = storage.get_schedule()
     if times:
         apply_schedule(application, times)
         logger.info("Loaded %s daily publication times.", len(times))
     else:
         logger.info("No publication schedule is set. Use /schedule in the bot.")
+    hour, minute = _parse_hhmm(DAILY_GENERATION_TIME)
+    application.job_queue.run_daily(
+        daily_generation_job,
+        time=time(hour=hour, minute=minute, tzinfo=TIMEZONE),
+        name="daily-generation",
+    )
+    settings = daily.automation_settings()
+    logger.info(
+        "Daily generation at %s: %s (trigger %s).",
+        DAILY_GENERATION_TIME,
+        "enabled" if settings["enabled"] else "disabled",
+        settings["trigger"],
+    )
+    if HOOK_TOKEN:
+        application.bot_data["hook_server"] = await start_hook_server(
+            HOOK_HOST, HOOK_PORT, HOOK_TOKEN, _handle_daily_hook
+        )
+
+
+async def shutdown(application: Application) -> None:
+    server = application.bot_data.get("hook_server")
+    if server is not None:
+        server.close()
+        await server.wait_closed()
 
 
 async def error_handler(
@@ -965,6 +1238,10 @@ async def error_handler(
 ) -> None:
     error_name = type(context.error).__name__ if context.error else "UnknownError"
     logger.error("Unhandled bot error (%s).", error_name)
+    await get_notifier(context.application).notify(
+        f"Botda xatolik: {error_name}. Tafsilotlar server logida.",
+        key=f"error:{error_name}",
+    )
     if (
         isinstance(update, Update)
         and update.effective_message
@@ -990,6 +1267,11 @@ COMMANDS = {
     "sources": sources_command,
     "setmeta": setmeta_command,
     "schedule": schedule_command,
+    "autogen": autogen_command,
+    "queue": queue_command,
+    "audit": audit_command,
+    "unapprove": unapprove_command,
+    "resolve": resolve_command,
 }
 # Updates the bot asks Telegram for: no channel posts, edits or group events.
 ALLOWED_UPDATES = [Update.MESSAGE, Update.CALLBACK_QUERY]
@@ -1028,6 +1310,7 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(startup)
+        .post_shutdown(shutdown)
         .build()
     )
     register_handlers(application)

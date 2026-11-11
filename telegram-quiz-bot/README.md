@@ -95,6 +95,16 @@ file contains placeholders only.
   fills them in itself. They appear on review cards and in the poll explanation.
 - `/schedule` — show and update the daily publishing schedule.
 - `/schedule 2 09:00,18:00` — publish one approved quiz at each time, daily.
+- `/autogen` — daily 09:00 (Asia/Tashkent) draft generation: `status`, `on`,
+  `off`, `run` (manual test run now), `trigger internal|activepieces`.
+  **Off by default.** It creates up to 10 drafts once per day and never pads
+  the number; drafts still need approval.
+- `/queue` — counts per status, stuck publications and queue warnings.
+- `/audit [n]` or `/audit #ID` — audit log of generate/approve/edit/reject/
+  unapprove/publish events with who and when.
+- `/unapprove <ID> [reason]` — send an approved or held question back to review.
+- `/resolve <ID> published [message_id]` or `/resolve <ID> approved` — settle a
+  publication whose result was unknown (see below).
 - `/help` — show help.
 
 Schedule times use 24-hour `HH:MM` format and `Asia/Tashkent` time by default.
@@ -130,6 +140,23 @@ relevant later sections are not ignored. Sections with no supported quiz questio
 are counted and reported rather than silently omitted. Generation is on-demand;
 `/generate` defaults to ten drafts, while `/schedule` continues to control only
 the publication of questions that an administrator has approved.
+
+## Safe publishing and alerts
+
+A scheduled slot claims one approved question atomically, sends it, then marks
+it published, so the same quiz cannot be posted twice. If Telegram refuses the
+send, the question returns to the queue. If the result is unknown (timeout,
+network error), it stays in `publishing`, is never resent automatically, and
+the administrator is asked to check the channel and run `/resolve`. An approved
+question that matches an already published one is put on `held`.
+
+The administrator gets a Telegram message for: unhandled errors, failed or
+partial daily generation (with the shortfall), an empty or low publishing
+queue, refused or uncertain sends, and held duplicates. Repeated alerts are
+suppressed for an hour.
+
+Running on your own server, the optional Activepieces hook and health check are
+described in `deploy/README.md`.
 
 ## Privacy of the control chat
 
