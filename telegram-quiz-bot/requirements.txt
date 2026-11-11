@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]>=21.10,<23
 openai>=1.60,<4
 pypdf>=5.1,<8
 python-docx>=1.1,<2
+# Time-zone database for Asia/Tashkent in slim container images.
+tzdata>=2024.1

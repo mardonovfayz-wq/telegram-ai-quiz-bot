@@ -40,10 +40,9 @@ path = "scripts/post-merge.sh"
 timeoutMs = 20000
 
 [userenv]
-
-[userenv.shared]
-ADMIN_ID = "1606891232"
-CHANNEL_ID = "@ARGOSTESTLA"
+# ADMIN_ID and CHANNEL_ID are no longer stored in this tracked file.
+# Set them in Replit Secrets (or the host environment) together with
+# TELEGRAM_BOT_TOKEN and OPENAI_API_KEY.
 
 [nix]
 channel = "stable-25_05"

@@ -1,0 +1,93 @@
+name: Offline tests
+
+# Runs the bot's offline test suite. It uses no secrets, makes no OpenAI or
+# Telegram calls, touches no database outside a temporary folder and deploys
+# nothing.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse tracked secrets, databases or uploads
+        run: |
+          set -eu
+          forbidden=$(git ls-files | grep -P \
+            '(^|/)\.env(\.(?!example$)[^/]*)?$|\.(sqlite3?|db)(-shm|-wal|-journal)?$|(^|/)(uploads|documents|secrets)/' \
+            || true)
+          if [ -n "$forbidden" ]; then
+            echo "These files must not be tracked:"
+            echo "$forbidden"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: telegram-quiz-bot/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r telegram-quiz-bot/requirements.txt
+
+      - name: Compile all bot modules
+        run: python -m compileall -q telegram-quiz-bot
+
+      - name: Run offline tests
+        env:
+          # Placeholder values only; the tests never contact Telegram or OpenAI.
+          TELEGRAM_BOT_TOKEN: "123456:offline-test-token"
+          OPENAI_API_KEY: "offline-test-key"
+          ADMIN_ID: "1"
+          CHANNEL_ID: "@offline_test_channel"
+        run: python -m unittest discover -s telegram-quiz-bot/tests -v
+
+  docker-image:
+    # Checks that the server image builds. Nothing is pushed or deployed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (no push)
+        run: docker build --tag quiz-bot:ci telegram-quiz-bot
+      - name: Image contains no tests, databases or env files
+        run: |
+          set -eu
+          docker run --rm --entrypoint sh quiz-bot:ci -c \
+            'test ! -e /app/tests && ! ls /app/*.sqlite3 2>/dev/null && test ! -e /app/.env'
+      - name: Image loads the whole bot with placeholder settings
+        # Imports every module and resolves Asia/Tashkent inside the image.
+        # Placeholders only; it does not start polling or contact any service.
+        run: |
+          docker run --rm \
+            -e TELEGRAM_BOT_TOKEN=123456:offline-test-token \
+            -e OPENAI_API_KEY=offline-test-key \
+            -e ADMIN_ID=1 \
+            -e CHANNEL_ID=@offline_test_channel \
+            quiz-bot:ci python -c "import bot; print('loaded', bot.TIMEZONE.key, bot.DAILY_GENERATION_TIME)"
+
+      - name: Data folder is writable by the bot user
+        run: docker run --rm quiz-bot:ci sh -c 'touch /data/write-test && rm /data/write-test'
+
+      - name: Image refuses to start without configuration
+        run: |
+          set -eu
+          if docker run --rm quiz-bot:ci; then
+            echo "The bot started without a token; it must refuse." && exit 1
+          fi
