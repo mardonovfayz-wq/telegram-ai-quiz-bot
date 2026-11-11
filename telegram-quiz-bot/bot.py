@@ -1,4 +1,8 @@
-"""Telegram bot entry point. Configure all credentials with Replit Secrets."""
+"""Telegram bot entry point.
+
+All credentials and identifiers come from environment variables (Replit
+Secrets or the host's environment); none are stored in tracked files.
+"""
 
 import asyncio
 import logging
@@ -21,13 +25,25 @@ from telegram.ext import (
 )
 
 import storage
+from bot_helpers import (
+    build_poll_explanation,
+    format_metadata,
+    format_question as _format_question,
+    parse_admin_id,
+    parse_channel_id,
+    parse_question_edit,
+    parse_schedule,
+    parse_source_metadata,
+    source_display_name,
+)
 from quiz_generator import (
     MAX_FILE_BYTES,
+    POLL_REFERENCE_MAX_CHARS,
     SectionProcessingError,
+    check_citation,
     extract_document,
     generate_questions,
     prepare_plain_text,
-    verify_grounding,
 )
 
 
@@ -42,8 +58,8 @@ def required_environment(name: str) -> str:
 
 BOT_TOKEN = required_environment("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = required_environment("OPENAI_API_KEY")
-ADMIN_ID = int(required_environment("ADMIN_ID"))
-CHANNEL_ID = required_environment("CHANNEL_ID")
+ADMIN_ID = parse_admin_id(required_environment("ADMIN_ID"))
+CHANNEL_ID = parse_channel_id(required_environment("CHANNEL_ID"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
 
 logging.basicConfig(
@@ -65,15 +81,39 @@ HELP_TEXT = (
     "/upload — PDF, DOCX, TXT yoki oddiy matn yuborish rejimi\n"
     "/generate [son] — manbalardan savollar yaratish (standart: 10)\n"
     "/questions [holat] [sahifa] — savollarni ko‘rish\n"
+    "/sources — manbalar ro‘yxati va huquqiy hujjat ma’lumotlari\n"
+    "/setmeta <ID> — manbaga rasmiy nom, raqam, sana va havola kiritish\n"
     "/schedule — nashr vaqtlarini ko‘rish yoki sozlash\n"
     "/help — yordam\n\n"
     "Yangi savollar avtomatik nashr qilinmaydi: har birini avval tasdiqlang."
 )
 
+METADATA_TEMPLATE = (
+    "Nomi: O‘zbekiston Respublikasining ... kodeksi\n"
+    "Raqami: O‘RQ-000\n"
+    "Sana: 01.01.2024\n"
+    "Havola: https://lex.uz/docs/...\n\n"
+    "Kerakli qatorlarnigina yuboring. Maydonni tozalash uchun qiymat o‘rniga - yozing."
+)
+
+# Only private-chat messages (not channel posts, group messages or edits)
+# ever reach the command, document and text handlers.
+PRIVATE_MESSAGES = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+
+
+def format_question(question: dict) -> str:
+    sources = storage.get_sources_by_ids(question.get("source_ids") or [])
+    return _format_question(question, sources[0] if sources else None)
+
 
 async def is_authorized_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
+    chat = update.effective_chat
+    if update.callback_query is None and (chat is None or chat.type != ChatType.PRIVATE):
+        # Never answer in channels or groups, not even with an error message.
+        return False
+
     user = update.effective_user
     if user is None or user.id != ADMIN_ID:
         if update.callback_query:
@@ -86,11 +126,10 @@ async def is_authorized_admin(
             )
         return False
 
-    chat = update.effective_chat
     if chat and chat.type != ChatType.PRIVATE:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "Boshqaruv buyruqlarini bot bilan shaxsiy chatda yuboring."
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Boshqaruv faqat shaxsiy chatda.", show_alert=True
             )
         return False
     return True
@@ -121,6 +160,7 @@ async def upload_command(
     context.user_data["awaiting_upload"] = True
     context.user_data.pop("awaiting_schedule", None)
     context.user_data.pop("editing_question_id", None)
+    context.user_data.pop("metadata_source_id", None)
     await update.effective_message.reply_text(
         "PDF, DOCX yoki TXT fayl yuboring. Oddiy matn uchun matnni shu yerga "
         "yuboring. Faqat yuborgan ma’lumotingiz manba sifatida ishlatiladi."
@@ -185,6 +225,10 @@ async def handle_text(
         await save_edited_question(update, context, text)
         return
 
+    if context.user_data.get("metadata_source_id"):
+        await save_source_metadata(update, context, text)
+        return
+
     if context.user_data.get("awaiting_schedule"):
         await set_schedule_from_text(update, context, text)
         return
@@ -204,6 +248,79 @@ async def handle_text(
         return
 
     await message.reply_text("Yordam uchun /help buyrug‘ini yuboring.")
+
+
+async def sources_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    sources = storage.list_sources()
+    if not sources:
+        await update.effective_message.reply_text(
+            "Hozircha manba yo‘q. /upload orqali yuboring."
+        )
+        return
+    lines = []
+    for source in sources[:30]:
+        status = "ma’lumot kiritilgan" if source.get("official_title") else "rasmiy ma’lumot yo‘q"
+        lines.append(
+            f"ID {source['id']}: {source['title']} — "
+            f"{source_display_name(source, source['title'])} ({status})"
+        )
+    note = "\n\n(oxirgi 30 ta manba ko‘rsatildi)" if len(sources) > 30 else ""
+    await update.effective_message.reply_text(
+        "Manbalar:\n" + "\n".join(lines) + note
+        + "\n\nRasmiy ma’lumot kiritish: /setmeta <ID>"
+    )
+
+
+async def setmeta_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "Foydalanish: /setmeta <manba ID>. ID ni /sources orqali ko‘ring."
+        )
+        return
+    source = storage.get_source(int(context.args[0]))
+    if not source:
+        await update.effective_message.reply_text("Bunday ID bilan manba topilmadi.")
+        return
+    context.user_data["metadata_source_id"] = source["id"]
+    context.user_data.pop("awaiting_upload", None)
+    context.user_data.pop("awaiting_schedule", None)
+    context.user_data.pop("editing_question_id", None)
+    await update.effective_message.reply_text(
+        f"Manba ID {source['id']}: {source['title']}\n"
+        f"Joriy ma’lumotlar:\n{format_metadata(source)}\n\n"
+        "Rasmiy hujjat ma’lumotlarini quyidagi shaklda yuboring "
+        "(bot ularni o‘zi to‘ldirmaydi):\n\n" + METADATA_TEMPLATE
+    )
+
+
+async def save_source_metadata(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    source_id = context.user_data.get("metadata_source_id")
+    try:
+        metadata = parse_source_metadata(text)
+    except ValueError as error:
+        await update.effective_message.reply_text(
+            f"{error}\n\nNamuna:\n{METADATA_TEMPLATE}"
+        )
+        return
+    if not storage.update_source_metadata(source_id, **metadata):
+        context.user_data.pop("metadata_source_id", None)
+        await update.effective_message.reply_text("Manba topilmadi; hech narsa saqlanmadi.")
+        return
+    context.user_data.pop("metadata_source_id", None)
+    source = storage.get_source(source_id)
+    await update.effective_message.reply_text(
+        f"Saqlandi. Manba ID {source_id}:\n{format_metadata(source)}"
+    )
 
 
 async def generate_command(
@@ -249,6 +366,7 @@ async def generate_command(
             sections_total=result["sections_total"],
             questions=questions,
             duplicates_removed=result["duplicates_removed"],
+            skipped_items=result["unsuitable_items"],
         )
         type_names = {
             "question_answer": "savol-javob",
@@ -289,6 +407,18 @@ async def generate_command(
             if delivery_failures
             else ""
         )
+        unsuitable = result["unsuitable_items"]
+        unsuitable_note = ""
+        if unsuitable:
+            examples = "\n".join(
+                f"• {item['source_title']}, {item['source_reference']}: {item['reason']}"
+                for item in unsuitable[:5]
+            )
+            more = f"\n… va yana {len(unsuitable) - 5} ta" if len(unsuitable) > 5 else ""
+            unsuitable_note = (
+                f"\nQuiz uchun yaroqsiz (o‘zgartirilmay saqlandi) asl savol-javoblar: "
+                f"{len(unsuitable)}\n{examples}{more}"
+            )
         try:
             await progress.edit_text(
                 f"To‘plam #{run_id} SQLite’da saqlandi.\n"
@@ -302,7 +432,8 @@ async def generate_command(
                 f"Tasdiqlashga tayyor qoralamalar: "
                 f"{result['ready_for_approval']}\n"
                 f"Manbasi tekshirilmagan qoralamalar: {result['source_unverified']}\n"
-                f"NEEDS_REVIEW holatidagi qoralamalar: {result['needs_review']}\n\n"
+                f"NEEDS_REVIEW holatidagi qoralamalar: {result['needs_review']}"
+                f"{unsuitable_note}\n\n"
                 "Har bir savol administrator tomonidan tasdiqlanmaguncha "
                 f"kanalga chiqmaydi.{delivery_note}"
             )
@@ -328,48 +459,6 @@ async def generate_command(
             "Savollar yaratilmadi. OpenAI kaliti, internet aloqasi va "
             "manba matnini tekshirib, qayta urinib ko‘ring."
         )
-
-
-def format_question(question: dict) -> str:
-    letters = ("A", "B", "C", "D")
-    options = "\n".join(
-        f"{letters[index]}) {option}" for index, option in enumerate(question["options"])
-    )
-    correct = letters[question["correct_index"]]
-    verification_note = ""
-    review_status = question.get("review_status", "NEEDS_REVIEW")
-    if review_status == "NEEDS_REVIEW":
-        verification_note = (
-            "\n\nNEEDS_REVIEW: administrator tekshiruvi shart.\n"
-            f"{question.get('source_review_note') or 'Manbani tekshiring.'}"
-        )
-    source_excerpt = question.get("source_excerpt", "")
-    excerpt_preview = source_excerpt[:500]
-    if len(source_excerpt) > 500:
-        excerpt_preview += "… [to‘liq parcha SQLite’da saqlangan]"
-    source_quote = question.get("source_quote", "")
-    quote_preview = source_quote[:500]
-    if len(source_quote) > 500:
-        quote_preview += "… [to‘liq iqtibos SQLite’da saqlangan]"
-    excerpt_block = ""
-    if source_excerpt and source_excerpt.strip() != source_quote.strip():
-        excerpt_block = f"\nManba parchasi: {excerpt_preview}"
-    original_pair = ""
-    if question.get("original_question"):
-        original_pair = (
-            "\nAsl savol-javob saqlangan:\n"
-            f"Savol: {question['original_question']}\n"
-            f"Javob: {question['original_answer']}\n"
-        )
-    return (
-        f"#{question['id']} · Holat: {question['status']} · "
-        f"{review_status}\n"
-        f"Hujjat turi: {question.get('document_type', 'unknown')}\n\n"
-        f"{question['question']}\n\n{options}\n\n"
-        f"To‘g‘ri javob: {correct}) {question['options'][question['correct_index']]}\n"
-        f"Manba: {question['source_title']}, {question['source_reference']}\n"
-        f"Asos: {quote_preview}{excerpt_block}{original_pair}{verification_note}"
-    )
 
 
 async def send_question_card(
@@ -516,61 +605,6 @@ async def question_action(
     )
 
 
-def parse_question_edit(text: str, old_question: dict) -> dict:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    fields: dict[str, str] = {}
-    options: dict[str, str] = {}
-    for line in lines:
-        field_match = re.match(r"^([^:]+):\s*(.*)$", line)
-        if field_match:
-            key = field_match.group(1).strip().lower().replace("‘", "'").replace("’", "'")
-            value = field_match.group(2).strip()
-            if key in {"savol", "question"}:
-                fields["question"] = value
-            elif key in {"to'g'ri javob", "tog'ri javob", "correct answer"}:
-                fields["correct"] = value.upper()
-            elif key == "manba":
-                fields["source"] = value
-            elif key in {"iqtibos", "quote"}:
-                fields["quote"] = value
-        option_match = re.match(r"^([A-D])[\).]\s*(.+)$", line, re.IGNORECASE)
-        if option_match:
-            options[option_match.group(1).upper()] = option_match.group(2).strip()
-
-    letters = ("A", "B", "C", "D")
-    question = fields.get("question", "").strip()
-    choices = [options.get(letter, "") for letter in letters]
-    correct_letter = fields.get("correct", "").strip().upper()
-    if not question or len(question) > 300:
-        raise ValueError("Savol matnini kiriting (300 belgigacha).")
-    if any(not choice or len(choice) > 100 for choice in choices):
-        raise ValueError("A), B), C), D) javoblarining barchasini kiriting (100 belgigacha).")
-    if len({choice.casefold() for choice in choices}) != 4:
-        raise ValueError("To‘rtta javob varianti bir-biridan farq qilishi kerak.")
-    if correct_letter not in letters:
-        raise ValueError("To‘g‘ri javob A, B, C yoki D bo‘lishi kerak.")
-
-    source_title = old_question["source_title"]
-    source_reference = old_question["source_reference"]
-    if fields.get("source"):
-        if "|" not in fields["source"]:
-            raise ValueError("Manbani 'fayl nomi | aniq havola' shaklida kiriting.")
-        source_title, source_reference = [
-            part.strip() for part in fields["source"].split("|", 1)
-        ]
-    source_quote = fields.get("quote", old_question["source_quote"]).strip()
-    if not source_title:
-        raise ValueError("Manba faylining nomini kiriting.")
-    return {
-        "question": question,
-        "options": choices,
-        "correct_index": letters.index(correct_letter),
-        "source_title": source_title,
-        "source_reference": source_reference,
-        "source_quote": source_quote,
-    }
-
-
 async def save_edited_question(
     update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
 ) -> None:
@@ -585,18 +619,33 @@ async def save_edited_question(
     try:
         edited = parse_question_edit(text, old_question)
         sources = storage.get_sources_by_ids(old_question["source_ids"])
-        verified, review_note = verify_grounding(
+        has_scope = (
+            old_question.get("section_start") is not None
+            and old_question.get("section_end") is not None
+        )
+        citation = check_citation(
             edited["source_title"],
             edited["source_reference"],
             edited["source_quote"],
             sources,
-            section_text=old_question["source_excerpt"]
-            if old_question.get("source_excerpt")
+            section_text=None
+            if has_scope
+            else (old_question.get("source_excerpt") or None),
+            scope=(old_question["section_start"], old_question["section_end"])
+            if has_scope
             else None,
         )
-        if len(edited["source_reference"]) > 190:
+        verified, review_note = citation.verified, citation.note
+        if verified and citation.canonical_reference:
+            edited["source_reference"] = citation.canonical_reference
+        if len(edited["source_reference"]) > POLL_REFERENCE_MAX_CHARS:
             verified = False
             review_note = "Havola juda uzun; qisqaroq aniq huquqiy havolani kiriting."
+        edited["quote_start"] = citation.quote_start
+        edited["quote_end"] = citation.quote_end
+        edited["legal_article"] = citation.article or ""
+        edited["legal_part"] = citation.part or ""
+        edited["legal_clause"] = citation.clause or ""
         edited["source_verified"] = verified
         edited["source_review_note"] = review_note
         edited["review_status"] = (
@@ -620,32 +669,6 @@ async def save_edited_question(
         await update.effective_message.reply_text(
             f"{error}\n\nSavolni yuqoridagi shaklda qayta yuboring."
         )
-
-
-def parse_schedule(text: str) -> list[str]:
-    parts = text.strip().split()
-    if len(parts) != 2:
-        raise ValueError("Shakl: 2 09:00,18:00")
-    try:
-        daily_count = int(parts[0])
-    except ValueError as error:
-        raise ValueError("Kunlik savollar sonini raqam bilan kiriting.") from error
-    times = [item.strip() for item in parts[1].split(",") if item.strip()]
-    if not 1 <= daily_count <= 10:
-        raise ValueError("Kuniga 1 dan 10 tagacha savol rejalashtirish mumkin.")
-    if len(times) != daily_count:
-        raise ValueError(
-            "Nashr vaqtlari soni kunlik savollar soniga teng bo‘lishi kerak."
-        )
-    if len(set(times)) != len(times):
-        raise ValueError("Nashr vaqtlari takrorlanmasligi kerak.")
-    for item in times:
-        if not re.fullmatch(r"\d{2}:\d{2}", item):
-            raise ValueError("Vaqtni 24 soatlik HH:MM shaklida kiriting.")
-        hour, minute = map(int, item.split(":"))
-        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-            raise ValueError(f"Noto‘g‘ri vaqt: {item}")
-    return sorted(times)
 
 
 def apply_schedule(application: Application, daily_times: list[str]) -> None:
@@ -700,6 +723,7 @@ async def schedule_command(
     context.user_data["awaiting_schedule"] = True
     context.user_data.pop("awaiting_upload", None)
     context.user_data.pop("editing_question_id", None)
+    context.user_data.pop("metadata_source_id", None)
     await update.effective_message.reply_text(
         f"{current}\nYangi jadvalni yuboring: kunlik_son HH:MM,HH:MM\n"
         "Masalan: 2 09:00,18:00\n"
@@ -714,9 +738,8 @@ async def publish_approved_question(
     if not question:
         logger.info("No approved questions are waiting to be published.")
         return
-    explanation = f"Manba: {question['source_title']}, {question['source_reference']}"
-    if len(explanation) > 200:
-        explanation = f"Manba: {question['source_reference']}"
+    sources = storage.get_sources_by_ids(question.get("source_ids") or [])
+    explanation = build_poll_explanation(question, sources[0] if sources else None)
     try:
         poll_message = await context.bot.send_poll(
             chat_id=CHANNEL_ID,
@@ -751,13 +774,53 @@ async def error_handler(
 ) -> None:
     error_name = type(context.error).__name__ if context.error else "UnknownError"
     logger.error("Unhandled bot error (%s).", error_name)
-    if isinstance(update, Update) and update.effective_message:
+    if (
+        isinstance(update, Update)
+        and update.effective_message
+        and update.effective_chat
+        and update.effective_chat.type == ChatType.PRIVATE
+    ):
         try:
             await update.effective_message.reply_text(
                 "Xatolik yuz berdi. Birozdan so‘ng qayta urinib ko‘ring."
             )
         except Exception:
             pass
+
+
+COMMANDS = {
+    "start": start_command,
+    "help": help_command,
+    "upload": upload_command,
+    "generate": generate_command,
+    "questions": questions_command,
+    "sources": sources_command,
+    "setmeta": setmeta_command,
+    "schedule": schedule_command,
+}
+# Updates the bot asks Telegram for: no channel posts, edits or group events.
+ALLOWED_UPDATES = [Update.MESSAGE, Update.CALLBACK_QUERY]
+
+
+def register_handlers(application: Application) -> None:
+    for name, callback in COMMANDS.items():
+        application.add_handler(
+            CommandHandler(name, callback, filters=PRIVATE_MESSAGES)
+        )
+    application.add_handler(
+        CallbackQueryHandler(
+            question_action, pattern=r"^(approve|edit|reject):\d+$"
+        )
+    )
+    application.add_handler(
+        MessageHandler(PRIVATE_MESSAGES & filters.Document.ALL, handle_document)
+    )
+    application.add_handler(
+        MessageHandler(
+            PRIVATE_MESSAGES & filters.TEXT & ~filters.COMMAND, handle_text
+        )
+    )
+    application.add_error_handler(error_handler)
 
 
 def main() -> None:
@@ -768,26 +831,9 @@ def main() -> None:
         .post_init(startup)
         .build()
     )
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("upload", upload_command))
-    application.add_handler(CommandHandler("generate", generate_command))
-    application.add_handler(CommandHandler("questions", questions_command))
-    application.add_handler(CommandHandler("schedule", schedule_command))
-    application.add_handler(
-        CallbackQueryHandler(
-            question_action, pattern=r"^(approve|edit|reject):\d+$"
-        )
-    )
-    application.add_handler(
-        MessageHandler(filters.Document.ALL, handle_document)
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
-    application.add_error_handler(error_handler)
+    register_handlers(application)
     logger.info("Starting the Telegram Quiz Bot.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":

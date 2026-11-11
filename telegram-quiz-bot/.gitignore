@@ -37,3 +37,7 @@ __pycache__/
 
 # Private files
 secrets/
+
+# Database backups created before schema updates
+*.backup-*.sqlite3
+*.sqlite3-journal

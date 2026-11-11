@@ -1,0 +1,58 @@
+name: Offline tests
+
+# Runs the bot's offline test suite. It uses no secrets, makes no OpenAI or
+# Telegram calls, touches no database outside a temporary folder and deploys
+# nothing.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse tracked secrets, databases or uploads
+        run: |
+          set -eu
+          forbidden=$(git ls-files | grep -P \
+            '(^|/)\.env(\.(?!example$)[^/]*)?$|\.(sqlite3?|db)(-shm|-wal|-journal)?$|(^|/)(uploads|documents|secrets)/' \
+            || true)
+          if [ -n "$forbidden" ]; then
+            echo "These files must not be tracked:"
+            echo "$forbidden"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: telegram-quiz-bot/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r telegram-quiz-bot/requirements.txt
+
+      - name: Compile all bot modules
+        run: python -m compileall -q telegram-quiz-bot
+
+      - name: Run offline tests
+        env:
+          # Placeholder values only; the tests never contact Telegram or OpenAI.
+          TELEGRAM_BOT_TOKEN: "123456:offline-test-token"
+          OPENAI_API_KEY: "offline-test-key"
+          ADMIN_ID: "1"
+          CHANNEL_ID: "@offline_test_channel"
+        run: python -m unittest discover -s telegram-quiz-bot/tests -v

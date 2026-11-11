@@ -3,8 +3,8 @@
 import json
 import asyncio
 import bisect
+import random
 import re
-import unicodedata
 from difflib import SequenceMatcher
 from io import BytesIO
 from typing import Any, Awaitable, Callable
@@ -19,35 +19,48 @@ from openai import (
 )
 from pypdf import PdfReader
 
+from legal_refs import (
+    LEGAL_HEADING_RE,
+    MARKER_RE,
+    CitationCheck,
+    find_inline_references,
+    has_article_headings,
+    locate_citation,
+    normalize,
+)
+
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
 SECTION_CHARS = 10_000
 MAX_QUESTIONS_PER_REQUEST = 20
 MAX_API_ATTEMPTS = 4
 MAX_RETRY_DELAY_SECONDS = 30
+# Telegram quiz-poll limits.
+POLL_QUESTION_MAX_CHARS = 300
+POLL_OPTION_MAX_CHARS = 100
+POLL_REFERENCE_MAX_CHARS = 190
 
 _LOCATION_RE = re.compile(r"(?im)^[ \t]*\[(?:Page|Paragraph|Line)\s+\d+\][^\n]*")
 _INLINE_LOCATION_PREFIX_RE = re.compile(
     r"(?i)^\s*\[(?:Page|Paragraph|Line)\s+\d+\]\s*"
 )
+# Q&A labels in Uzbek Latin, Uzbek Cyrillic, Russian and English, optionally
+# numbered: "Savol:", "1-savol:", "Савол 2:", "3. Вопрос:", "Question №4:".
+_QA_NUMBER_PREFIX = r"(?:(?:\d+)\s*[.)]\s*|\d+\s*-\s*)?"
+_QA_NUMBER_SUFFIX = r"\s*(?:№|#)?\s*(?:\d+)?\s*[:：]\s*(.*?)\s*$"
 _QA_QUESTION_RE = re.compile(
-    r"(?i)^\s*(?:(?:\d+)[.)]\s*)?(?:savol|question|q)\s*(?:#?\s*\d+)?\s*:\s*(.*?)\s*$"
+    rf"(?i)^\s*{_QA_NUMBER_PREFIX}(?:savol|савол|вопрос|question|q){_QA_NUMBER_SUFFIX}"
 )
 _QA_ANSWER_RE = re.compile(
-    r"(?i)^\s*(?:(?:\d+)[.)]\s*)?(?:javob|answer)\s*(?:#?\s*\d+)?\s*:\s*(.*?)\s*$"
+    rf"(?i)^\s*{_QA_NUMBER_PREFIX}(?:javob|жавоб|ответ|answer){_QA_NUMBER_SUFFIX}"
 )
-_LEGAL_HEADING_RE = re.compile(
-    r"(?im)^[ \t]*(?:"
-    r"\d+\s*[-–—.]?\s*(?:modda|band|qism)\b[^\n]*|"
-    r"(?:modda|article|section|статья|§)\s*(?:№\s*)?[\w./-]+[^\n]*|"
-    r"(?:\d+|[IVXLCDM]+)\s*[-–—.]?\s*"
-    r"(?:bob|bo['’‘]lim|chapter|глава|раздел)\b[^\n]*)"
-)
-_LEGAL_LOCATOR_RE = re.compile(
-    r"(?i)(?:\d+\s*[-–—.]?\s*(?:modda|band|qism|bob|bo['’‘]lim)\b|"
-    r"(?:modda|article|section|статья|band|qism|chapter|глава|раздел)"
-    r"\s*(?:№\s*)?[\w./-]+|§\s*[\w./-]+)"
-)
+_LEGAL_HEADING_RE = LEGAL_HEADING_RE
+
+_system_random = random.SystemRandom()
+
+
+class UnsuitableForPoll(ValueError):
+    """An original Q&A pair cannot become a Telegram quiz without rewriting it."""
 
 
 class SectionProcessingError(RuntimeError):
@@ -148,6 +161,8 @@ def extract_question_answer_pairs(content: str) -> list[dict[str, Any]]:
     active_field: str | None = None
     offset = 0
     pending_location_start: int | None = None
+    all_markers = list(MARKER_RE.finditer(content))
+    marker_starts = [match.start() for match in all_markers]
 
     def finish(end: int) -> None:
         nonlocal current, active_field
@@ -157,27 +172,26 @@ def extract_question_answer_pairs(content: str) -> list[dict[str, Any]]:
         answer = " ".join(current["answer_parts"]).strip()
         if question and answer:
             excerpt = content[current["start"]:end]
-            answer_position = excerpt.find(current["answer_parts"][0]) if current["answer_parts"] else -1
-            legal = list(_LEGAL_LOCATOR_RE.finditer(excerpt))
-            locations = list(_LOCATION_RE.finditer(excerpt))
-            before_answer = [match for match in legal if match.start() <= answer_position]
-            if before_answer:
-                reference = before_answer[-1].group(0).strip()
+            # The location reference is the document marker(s) the pair sits
+            # under. Legal articles mentioned inside the answer are the Q&A
+            # author's own legal basis and are kept separately, verbatim.
+            first_index = bisect.bisect_right(marker_starts, current["start"])
+            last_index = bisect.bisect_left(marker_starts, end)
+            markers = all_markers[max(first_index - 1, 0):first_index]
+            markers += all_markers[first_index:last_index]
+            if not markers:
+                reference = current["question_label"]
+            elif len(markers) == 1:
+                reference = markers[0].group(0)
             else:
-                before_answer = [
-                    match for match in locations if match.start() <= answer_position
-                ]
-                reference = (
-                    before_answer[-1].group(0).strip()
-                    if before_answer
-                    else current["question_label"]
-                )
+                reference = f"{markers[0].group(0)}–{markers[-1].group(0)}"
             pairs.append(
                 {
                     "question": question,
                     "answer": answer,
                     "source_excerpt": excerpt,
                     "source_reference": reference,
+                    "legal_basis": "; ".join(find_inline_references(excerpt)),
                     "start": current["start"],
                     "end": end,
                 }
@@ -247,8 +261,10 @@ def classify_document(content: str) -> str:
             max(0, pair["end"] - pair["start"]) for pair in pairs
         )
         legal_outside_pairs = any(
-            not any(pair["start"] <= match.start() < pair["end"] for pair in pairs)
-            for match in _LEGAL_LOCATOR_RE.finditer(content)
+            not any(pair["start"] <= position < pair["end"] for pair in pairs)
+            for position in (
+                match.start() for match in _LEGAL_HEADING_RE.finditer(content)
+            )
         )
         coverage = covered_characters / max(len(content), 1)
         if legal_outside_pairs or coverage < 0.60:
@@ -265,7 +281,9 @@ def classify_document(content: str) -> str:
     )
     if has_partial_qa_labels:
         return "mixed"
-    if _LEGAL_LOCATOR_RE.search(content):
+    # Only real article headings ("5-modda.", "5-модда.", "Статья 5.") make a
+    # document normative; words such as "moddaning" or "band" do not.
+    if has_article_headings(content):
         return "normative_legal"
     return "general"
 
@@ -303,11 +321,8 @@ def build_source_sections(
     for start, end, pair in ranges:
         excerpt = content[start:end]
         if pair is not None:
-            if len(excerpt) > max_chars:
-                raise ValueError(
-                    f"{title}: Q&A jufti {max_chars} belgilik bo‘limdan uzun. "
-                    "Faylni kichikroq qismlarga ajrating."
-                )
+            # An over-long pair is kept whole; generation flags it as
+            # unsuitable for a poll instead of aborting the whole run.
             section_number += 1
             pair_sections.append(
                 {
@@ -323,6 +338,7 @@ def build_source_sections(
                     "original_question": pair["question"],
                     "original_answer": pair["answer"],
                     "source_reference": pair["source_reference"],
+                    "legal_basis": pair.get("legal_basis", ""),
                 }
             )
             continue
@@ -464,20 +480,33 @@ def chunk_document(
     return sections
 
 
-def _normalize(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", text).lower()
-    normalized = normalized.replace("’", "'").replace("‘", "'").replace("`", "'")
-    return " ".join(normalized.split())
+_normalize = normalize
+_SECTION_CONTEXT_RE = re.compile(r"\A\[Section context: [^\n]*\]\n")
 
 
-def verify_grounding(
+def _scope_of_section_text(content: str, section_text: str) -> tuple[int, int] | None:
+    excerpt = _SECTION_CONTEXT_RE.sub("", section_text, count=1)
+    position = content.find(excerpt) if excerpt else -1
+    if position < 0:
+        return None
+    return position, position + len(excerpt)
+
+
+def check_citation(
     source_title: str,
     source_reference: str,
     source_quote: str,
     available_sources: list[dict[str, Any]],
     section_text: str | None = None,
-) -> tuple[bool, str]:
-    """Check the exact source locator and evidence; report uncertainty for review."""
+    scope: tuple[int, int] | None = None,
+) -> CitationCheck:
+    """Locate the quote in the source and check the cited article/part/clause.
+
+    The reference must name exactly where the quote is: the enclosing article
+    (strict number match, so 1-modda never passes for 21-modda), and the part
+    and clause when they are cited. Nothing is auto-corrected; a mismatch is
+    reported for administrator review.
+    """
     source = next(
         (
             item
@@ -487,46 +516,35 @@ def verify_grounding(
         None,
     )
     if source is None:
-        return False, "Manba fayli mos kelmadi; fayl nomini administrator tekshirsin."
+        return CitationCheck(
+            False, "Manba fayli mos kelmadi; fayl nomini administrator tekshirsin."
+        )
+    content = source["content"]
+    if scope is None and section_text is not None:
+        scope = _scope_of_section_text(content, section_text)
+        if scope is None and _normalize(source_quote) not in _normalize(section_text):
+            return CitationCheck(
+                False, "Asoslovchi iqtibos aynan qayta ishlangan bo‘limda topilmadi."
+            )
+    return locate_citation(content, source_reference, source_quote, scope=scope)
 
-    source_text = _normalize(source["content"])
-    if not source_reference.strip() or _normalize(source_reference) not in source_text:
-        return False, "Manba havolasi fayl matnida aniq topilmadi."
-    if section_text is not None and _normalize(source_reference) not in _normalize(section_text):
-        return False, "Manba havolasi aynan qayta ishlangan bo‘limda topilmadi."
-    citation_scope = section_text if section_text is not None else source["content"]
-    normalized_scope = _normalize(citation_scope)
-    normalized_reference = _normalize(source_reference)
-    legal_locators = [
-        _normalize(match.group(0))
-        for match in _LEGAL_LOCATOR_RE.finditer(normalized_scope)
-    ]
-    if legal_locators and not any(
-        locator in normalized_reference for locator in legal_locators
-    ):
-        return (
-            False,
-            "Bo‘limda huquqiy modda yoki band bor, lekin u havolada ko‘rsatilmagan.",
-        )
-    quote_position = normalized_scope.find(_normalize(source_quote))
-    locators_before_quote = [
-        _normalize(match.group(0))
-        for match in _LEGAL_LOCATOR_RE.finditer(normalized_scope)
-        if match.start() <= quote_position
-    ]
-    if (
-        locators_before_quote
-        and locators_before_quote[-1] not in normalized_reference
-    ):
-        return (
-            False,
-            "Iqtibosning bevosita huquqiy modda yoki band havolasi ko‘rsatilmagan.",
-        )
-    if len(source_quote.strip()) < 12 or _normalize(source_quote) not in source_text:
-        return False, "Asoslovchi iqtibos manbada aniq topilmadi."
-    if section_text is not None and _normalize(source_quote) not in _normalize(section_text):
-        return False, "Asoslovchi iqtibos aynan qayta ishlangan bo‘limda topilmadi."
-    return True, ""
+
+def verify_grounding(
+    source_title: str,
+    source_reference: str,
+    source_quote: str,
+    available_sources: list[dict[str, Any]],
+    section_text: str | None = None,
+) -> tuple[bool, str]:
+    """Backward-compatible (verified, note) wrapper around ``check_citation``."""
+    result = check_citation(
+        source_title,
+        source_reference,
+        source_quote,
+        available_sources,
+        section_text=section_text,
+    )
+    return result.verified, result.note
 
 
 def validate_grounding(
@@ -699,10 +717,13 @@ dalil bermasa, bo‘sh ro‘yxat qaytaring.
 Har bir savol:
 - Uzbek tilida, lotin yozuvida bo‘lsin.
 - Aynan 4 ta turli variant va yagona correct_index (0–3) qaytarsin.
-- source_reference sifatida bo‘lim ichida aynan ko‘rinadigan modda, band, qism,
-  sarlavha yoki [Page N]/[Paragraph N]/[Line N] belgisini ko‘chirsin.
-- Agar bo‘limda modda, band yoki qism ko‘rsatilgan bo‘lsa, uni sahifa
-  belgisidan ustun qo‘ying va havolaga kiriting.
+- source_reference iqtibos joylashgan aniq modda (modda/модда/статья),
+  kerak bo‘lsa qism (qism/қисм/часть) va band (band/банд/пункт) raqamini
+  bo‘limdagi kabi ko‘rsatsin, masalan "5-modda, 2-qism, 3-band",
+  "5-модда, 2-қисм" yoki "Статья 5, часть 2, пункт 3". Bot iqtibos
+  joylashgan joyni manbadan tekshiradi; mos kelmagan havola rad etiladi.
+- Agar iqtibos moddaga tegishli bo‘lsa, modda raqamini albatta kiriting;
+  sahifa belgisi modda o‘rnini bosa olmaydi.
 - Huquqiy lokator bo‘lmasa, mavjud [Page N], [Paragraph N] yoki [Line N]
   belgisini ishlating. Manbada bunday belgi ham bo‘lmasa, bo‘sh qaytaring.
   Raqam yoki qonun moddasini aslo uydirmang.
@@ -746,15 +767,9 @@ async def _generate_from_question_answer(
 ) -> list[dict[str, Any]]:
     original_question = section["original_question"]
     original_answer = section["original_answer"]
-    if (
-        not original_question
-        or len(original_question) > 300
-        or not original_answer
-        or len(original_answer) > 100
-    ):
-        raise ValueError(
-            "Asl savol 300 yoki javob 100 belgidan oshdi; xavfsiz quiz varianti tuzilmadi."
-        )
+    reason = qa_poll_unsuitability(section)
+    if reason:
+        raise UnsuitableForPoll(reason)
     prompt = f"""
 Quyidagi savol-javob juftligidan BIR ta Telegram quiz uchun 3 ta distractor yarating.
 Savol matnini va to‘g‘ri javobni manbadan aynan olinganidek saqlang.
@@ -821,9 +836,50 @@ JAVOBLAR BANKI:
             "document_type": section.get("document_type", "question_answer"),
             "original_question": original_question,
             "original_answer": original_answer,
+            "legal_basis": section.get("legal_basis", ""),
             "distractors_grounded": bank_grounded,
         }
     ]
+
+
+def qa_poll_unsuitability(section: dict[str, Any]) -> str:
+    """Why an original Q&A pair cannot be a Telegram quiz unchanged ('' if it can).
+
+    The original wording is never shortened or rewritten to fit Telegram's
+    limits; such pairs are reported to the administrator instead.
+    """
+    question = section.get("original_question", "")
+    answer = section.get("original_answer", "")
+    if not question or not answer:
+        return "Asl savol yoki javob bo‘sh."
+    if len(question) > POLL_QUESTION_MAX_CHARS:
+        return (
+            f"Asl savol {len(question)} belgi; Telegram quiz savoli "
+            f"{POLL_QUESTION_MAX_CHARS} belgidan oshmasligi kerak."
+        )
+    if len(answer) > POLL_OPTION_MAX_CHARS:
+        return (
+            f"Asl javob {len(answer)} belgi; Telegram quiz varianti "
+            f"{POLL_OPTION_MAX_CHARS} belgidan oshmasligi kerak."
+        )
+    return ""
+
+
+def shuffle_options(
+    options: list[str],
+    correct_index: int,
+    rng: random.Random | None = None,
+) -> tuple[list[str], int]:
+    """Randomise option order and return the new index of the same correct answer."""
+    rng = rng or _system_random
+    correct_text = options[correct_index]
+    order = list(range(len(options)))
+    rng.shuffle(order)
+    shuffled = [options[index] for index in order]
+    new_index = order.index(correct_index)
+    if shuffled[new_index] != correct_text:  # defensive; must never happen
+        raise RuntimeError("Answer shuffling lost the correct option.")
+    return shuffled, new_index
 
 
 async def generate_questions(
@@ -833,6 +889,7 @@ async def generate_questions(
     existing_question_texts: list[str] | None = None,
     progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
     section_chars: int = SECTION_CHARS,
+    rng: random.Random | None = None,
 ) -> dict[str, Any]:
     """Process every source section independently and return one deduplicated set."""
     if not sources:
@@ -851,9 +908,11 @@ async def generate_questions(
             max_chars=section_chars,
         )
         document_types[source["id"]] = document_type
+        # Only answers that fit in a poll option can serve as distractors.
         answer_banks[source["id"]] = [
             pair["answer"]
             for pair in extract_question_answer_pairs(source["content"])
+            if len(pair["answer"]) <= POLL_OPTION_MAX_CHARS
         ]
         sections.extend(source_sections)
     if not sections:
@@ -871,12 +930,37 @@ async def generate_questions(
 
     seen_questions = list(existing_question_texts or [])
     new_questions: list[dict[str, Any]] = []
+    unsuitable_items: list[dict[str, Any]] = []
     duplicate_count = 0
     empty_section_count = 0
     processed_sections = 0
+    content_by_source = {item["id"]: item["content"] for item in sources}
 
     for index, section in enumerate(sections, start=1):
         try:
+            if section.get("section_kind") == "question_answer":
+                reason = qa_poll_unsuitability(section)
+                if reason:
+                    # Report it; never shorten or rewrite the original pair.
+                    unsuitable_items.append(
+                        {
+                            "source_id": section["source_id"],
+                            "source_title": section["source_title"],
+                            "section_number": section["section_number"],
+                            "section_start": section["start"],
+                            "section_end": section["end"],
+                            "source_reference": section.get("source_reference", ""),
+                            "original_question": section.get("original_question", ""),
+                            "original_answer": section.get("original_answer", ""),
+                            "reason": reason,
+                        }
+                    )
+                    processed_sections += 1
+                    if progress_callback:
+                        await progress_callback(
+                            processed_sections, total_sections, len(new_questions)
+                        )
+                    continue
             candidates = await _generate_for_section(
                 client,
                 section,
@@ -886,23 +970,26 @@ async def generate_questions(
             source_record = {
                 "id": section["source_id"],
                 "title": section["source_title"],
-                "content": next(
-                    item["content"]
-                    for item in sources
-                    if item["id"] == section["source_id"]
-                ),
+                "content": content_by_source[section["source_id"]],
             }
             if not candidates:
                 empty_section_count += 1
             for candidate in candidates:
-                verified, review_note = verify_grounding(
+                citation = check_citation(
                     section["source_title"],
                     candidate["source_reference"],
                     candidate["source_quote"],
                     [source_record],
-                    section_text=section["content"],
+                    scope=(section["start"], section["end"]),
                 )
-                if len(candidate["source_reference"]) > 190:
+                verified, review_note = citation.verified, citation.note
+                if verified and citation.canonical_reference:
+                    # Store the location derived from the document itself.
+                    candidate["source_reference"] = citation.canonical_reference
+                candidate["options"], candidate["correct_index"] = shuffle_options(
+                    candidate["options"], candidate["correct_index"], rng
+                )
+                if len(candidate["source_reference"]) > POLL_REFERENCE_MAX_CHARS:
                     verified = False
                     review_note = (
                         "Havola Telegram quiz izohiga sig‘maydi; "
@@ -933,6 +1020,14 @@ async def generate_questions(
                         "document_type": document_type,
                         "original_question": section.get("original_question", ""),
                         "original_answer": section.get("original_answer", ""),
+                        "legal_basis": section.get("legal_basis", ""),
+                        "section_start": section["start"],
+                        "section_end": section["end"],
+                        "quote_start": citation.quote_start,
+                        "quote_end": citation.quote_end,
+                        "legal_article": citation.article or "",
+                        "legal_part": citation.part or "",
+                        "legal_clause": citation.clause or "",
                         "review_status": (
                             "NEEDS_REVIEW" if needs_review else "READY_FOR_APPROVAL"
                         ),
@@ -1005,4 +1100,6 @@ async def generate_questions(
         },
         "document_type_counts": document_type_counts,
         "requested_count": count,
+        "unsuitable_items": unsuitable_items,
+        "unsuitable_count": len(unsuitable_items),
     }

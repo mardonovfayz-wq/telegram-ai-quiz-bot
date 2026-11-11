@@ -14,8 +14,22 @@ administrator approves them.
 - Sends every section to OpenAI separately. It checks complete text coverage and
   reports the number of sections processed.
 - Distinguishes explicitly labeled question–answer documents from normative
-  legal text and general material. Original Q&A wording and answers are retained;
-  normative text is chunked around legal headings and source markers.
+  legal text and general material. Q&A labels are recognised in Uzbek Latin
+  (`Savol:` / `Javob:`), Uzbek Cyrillic (`Савол:` / `Жавоб:`), Russian
+  (`Вопрос:` / `Ответ:`) and English. Original Q&A wording and answers are
+  retained; normative text is chunked around legal headings and source markers.
+- Reads the article → part → clause structure of normative text in Uzbek Latin
+  (`modda`, `qism`, `band`), Uzbek Cyrillic (`модда`, `қисм`, `банд`) and
+  Russian (`статья`, `часть`, `пункт`). A citation is accepted only if the
+  supporting quote really sits in the cited article (and part/clause, when
+  cited). Numbers are matched strictly, so `1-modda` never matches `21-modda`,
+  and ordinary words such as `moddaning` or `band bo‘lgan` are not citations.
+- Stores, for every draft, the exact section offsets and quote offsets in the
+  uploaded source, plus the located article, part and clause.
+- Randomises the position of the correct answer in every quiz.
+- Original Q&A pairs too long for a Telegram poll (question over 300 or answer
+  over 100 characters) are never shortened: they are reported as unsuitable and
+  stored unchanged, and generation continues with the other sections.
 - Creates four-option questions in Uzbek using only the current section. The
   exact source excerpt, document type, citation, and any original Q&A pair are
   stored with each draft in SQLite.
@@ -43,13 +57,15 @@ character limit applied to extracted text, not the raw Telegram file size.
 1. Open this project in Replit. The bot uses the `Telegram Quiz Bot` workflow.
    Start that workflow to run the bot; keep it running while you want the bot
    to receive messages and publish scheduled polls.
-2. In **Tools → Secrets**, add:
+2. In **Tools → Secrets**, add all four values (none of them is stored in
+   tracked files such as `.replit`):
    - `TELEGRAM_BOT_TOKEN` — create a bot with Telegram's `@BotFather`.
    - `OPENAI_API_KEY` — an OpenAI API key.
-3. In Replit's environment variables, set:
    - `ADMIN_ID` — your numeric Telegram user ID. `@userinfobot` can show it.
    - `CHANNEL_ID` — the channel username, such as `@mychannel`, or its numeric
      channel ID, usually beginning with `-100`.
+   Optional: `QUIZ_BOT_DB_PATH` — full path of the SQLite file on a persistent
+   disk (default: `telegram-quiz-bot/quiz_bot.sqlite3`).
 4. Add the bot to the destination channel as an administrator with permission
    to post messages.
 5. Start the workflow. In a private chat with the bot, send `/start`.
@@ -67,6 +83,10 @@ file contains placeholders only.
 - `/questions pending 2` — review the second page of pending questions.
 - `/questions approved` — list approved questions waiting for the schedule.
 - `/questions published 2` — list the second page of published questions.
+- `/sources` — list uploaded sources with their legal-act metadata status.
+- `/setmeta 3` — enter the official title, number, adoption date and source URL
+  of source 3. These values are typed by the administrator; the bot never
+  fills them in itself. They appear on review cards and in the poll explanation.
 - `/schedule` — show and update the daily publishing schedule.
 - `/schedule 2 09:00,18:00` — publish one approved quiz at each time, daily.
 - `/help` — show help.
@@ -82,6 +102,12 @@ relevant later sections are not ignored. Sections with no supported quiz questio
 are counted and reported rather than silently omitted. Generation is on-demand;
 `/generate` defaults to ten drafts, while `/schedule` continues to control only
 the publication of questions that an administrator has approved.
+
+## Privacy of the control chat
+
+The bot only reacts to messages in a private chat with the administrator.
+Channel posts, group messages and edited messages never reach its handlers, and
+it never replies inside a channel or group.
 
 ## Question review
 
@@ -103,7 +129,12 @@ Manba: fayl_nomi.pdf | 3-modda
 Iqtibos: manbadan aynan olingan jumla
 ```
 
-The source reference and quote must still match the uploaded excerpt. If the
+The source reference and quote must still match the uploaded excerpt. Write the
+reference as the article (and part/clause if you want them), for example
+`3-modda`, `3-modda, 2-qism, 1-band`, `3-модда, 2-қисм` or
+`Статья 3, часть 2, пункт 1`. In PDF text, line breaks are page layout, so the
+bot cannot count unnumbered parts; cite only the article there unless the parts
+are numbered. If the
 document has no article or section labels, the bot uses extracted page,
 paragraph, or line markers rather than inventing a legal citation. If a reference,
 quote, document classification, or Q&A distractor cannot be verified, the draft
@@ -120,13 +151,23 @@ document's answer bank are flagged for administrator review.
 - `bot.py` — Telegram commands, approval buttons, and scheduled publishing.
 - `quiz_generator.py` — PDF/DOCX/TXT extraction and OpenAI question generation.
 - `storage.py` — SQLite persistence.
+- `legal_refs.py` — strict legal locators, article/part/clause structure and
+  citation checks.
+- `bot_helpers.py` — parsing and formatting used by the bot (testable offline).
 - `tests/test_large_documents.py` — offline chunking, Q&A preservation, citation,
   retry/repair, deduplication, migration, and approval-gate tests.
+- `tests/test_legal_accuracy.py` — strict article matching, three-script legal
+  terms and Q&A labels, long Q&A answers, answer randomisation, excerpt
+  preservation, metadata, migration backups and configuration safety.
+- `tests/test_bot_handlers.py` — private-chat-only handler tests (need
+  `python-telegram-bot`; they run in GitHub Actions).
 - `requirements.txt` — Python dependencies.
 
 The SQLite database is created automatically next to the bot code as
-`quiz_bot.sqlite3`. It is excluded from Git. Keep a backup if you need to
-preserve it across workspace changes.
+`quiz_bot.sqlite3` (or at `QUIZ_BOT_DB_PATH`). It is excluded from Git. Before
+the bot adds new columns to an existing database, it saves a full copy next to
+it as `quiz_bot.backup-<UTC time>.sqlite3`; schema updates only add columns and
+tables and never change existing rows. Keep your own backup as well.
 
 ## Run the offline checks
 
@@ -137,4 +178,7 @@ python3 -m unittest discover -s telegram-quiz-bot/tests -v
 ```
 
 These checks use a fake OpenAI response; they do not make paid API calls or
-publish messages to Telegram.
+publish messages to Telegram. GitHub Actions (`.github/workflows/tests.yml`)
+runs the same suite on every push and pull request, and fails if a database,
+`.env` file or upload folder is ever committed. It uses no secrets and deploys
+nothing.

@@ -6,7 +6,7 @@ A beginner-friendly Python Telegram bot that creates source-grounded Uzbek quiz 
 
 - Start the `Telegram Quiz Bot` workflow to run `python3 telegram-quiz-bot/bot.py`.
 - Set `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY` as Replit Secrets.
-- Set `ADMIN_ID` and `CHANNEL_ID` as Replit environment variables.
+- Set `ADMIN_ID` and `CHANNEL_ID` as Replit Secrets too; they are not stored in `.replit`.
 - The bot creates and uses `telegram-quiz-bot/quiz_bot.sqlite3`.
 
 ## Stack

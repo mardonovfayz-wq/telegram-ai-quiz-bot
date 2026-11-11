@@ -1,6 +1,8 @@
 """Small SQLite helpers for the Telegram quiz bot."""
 
 import json
+import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -8,7 +10,20 @@ from pathlib import Path
 from typing import Any
 
 
-DB_PATH = Path(__file__).with_name("quiz_bot.sqlite3")
+# QUIZ_BOT_DB_PATH lets a future host keep the database on a persistent disk.
+# The default location is unchanged: next to the bot code.
+DB_PATH = Path(
+    os.getenv("QUIZ_BOT_DB_PATH", "").strip()
+    or Path(__file__).with_name("quiz_bot.sqlite3")
+)
+logger = logging.getLogger(__name__)
+
+SOURCE_METADATA_FIELDS = (
+    "official_title",
+    "document_number",
+    "adoption_date",
+    "source_url",
+)
 
 
 def _connect() -> sqlite3.Connection:
@@ -32,16 +47,92 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_QUESTION_MIGRATIONS = {
+    "source_verified": "INTEGER NOT NULL DEFAULT 1",
+    "source_review_note": "TEXT NOT NULL DEFAULT ''",
+    "source_excerpt": "TEXT NOT NULL DEFAULT ''",
+    "document_type": "TEXT NOT NULL DEFAULT 'unknown'",
+    "original_question": "TEXT NOT NULL DEFAULT ''",
+    "original_answer": "TEXT NOT NULL DEFAULT ''",
+    "review_status": "TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'",
+    "generation_run_id": "INTEGER",
+    "legal_basis": "TEXT NOT NULL DEFAULT ''",
+    "section_start": "INTEGER",
+    "section_end": "INTEGER",
+    "quote_start": "INTEGER",
+    "quote_end": "INTEGER",
+    "legal_article": "TEXT NOT NULL DEFAULT ''",
+    "legal_part": "TEXT NOT NULL DEFAULT ''",
+    "legal_clause": "TEXT NOT NULL DEFAULT ''",
+}
+_SOURCE_MIGRATIONS = {
+    field: "TEXT NOT NULL DEFAULT ''" for field in SOURCE_METADATA_FIELDS
+}
+_RUN_MIGRATIONS = {"needs_review_count": "INTEGER NOT NULL DEFAULT 0"}
+_EXPECTED_TABLES = {"sources", "generation_runs", "questions", "skipped_items", "settings"}
+
+
+def _pending_migrations(connection: sqlite3.Connection, tables: set[str]) -> list[str]:
+    statements: list[str] = []
+    for table, columns in (
+        ("questions", _QUESTION_MIGRATIONS),
+        ("sources", _SOURCE_MIGRATIONS),
+        ("generation_runs", _RUN_MIGRATIONS),
+    ):
+        if table not in tables:
+            continue  # created below with every column
+        existing = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for column, definition in columns.items():
+            if column not in existing:
+                statements.append(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
+    return statements
+
+
+def _backup_database(connection: sqlite3.Connection) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.backup-{stamp}.sqlite3")
+    destination = sqlite3.connect(backup_path)
+    try:
+        connection.backup(destination)
+    finally:
+        destination.close()
+    return backup_path
+
+
 def initialize_database() -> None:
-    """Create the database tables if they do not exist yet."""
+    """Create missing tables and add missing columns (additive only).
+
+    Before changing the schema of an existing database, a full copy is saved
+    next to it as ``<name>.backup-<UTC timestamp>.sqlite3``. Existing rows are
+    never modified or deleted.
+    """
+    existed = DB_PATH.exists() and DB_PATH.stat().st_size > 0
     with _database() as connection:
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        pending = _pending_migrations(connection, tables)
+        if existed and tables and (pending or not _EXPECTED_TABLES <= tables):
+            backup_path = _backup_database(connection)
+            logger.info("Database backed up before schema update: %s", backup_path.name)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                official_title TEXT NOT NULL DEFAULT '',
+                document_number TEXT NOT NULL DEFAULT '',
+                adoption_date TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS generation_runs (
@@ -76,7 +167,29 @@ def initialize_database() -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                published_message_id INTEGER
+                published_message_id INTEGER,
+                legal_basis TEXT NOT NULL DEFAULT '',
+                section_start INTEGER,
+                section_end INTEGER,
+                quote_start INTEGER,
+                quote_end INTEGER,
+                legal_article TEXT NOT NULL DEFAULT '',
+                legal_part TEXT NOT NULL DEFAULT '',
+                legal_clause TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS skipped_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation_run_id INTEGER REFERENCES generation_runs(id),
+                source_id INTEGER,
+                source_title TEXT NOT NULL,
+                source_reference TEXT NOT NULL DEFAULT '',
+                section_start INTEGER,
+                section_end INTEGER,
+                original_question TEXT NOT NULL DEFAULT '',
+                original_answer TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -85,53 +198,8 @@ def initialize_database() -> None:
             );
             """
         )
-        question_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(questions)")
-        }
-        migrations = {
-            "source_verified": (
-                "ALTER TABLE questions ADD COLUMN source_verified "
-                "INTEGER NOT NULL DEFAULT 1"
-            ),
-            "source_review_note": (
-                "ALTER TABLE questions ADD COLUMN source_review_note "
-                "TEXT NOT NULL DEFAULT ''"
-            ),
-            "source_excerpt": (
-                "ALTER TABLE questions ADD COLUMN source_excerpt "
-                "TEXT NOT NULL DEFAULT ''"
-            ),
-            "document_type": (
-                "ALTER TABLE questions ADD COLUMN document_type "
-                "TEXT NOT NULL DEFAULT 'unknown'"
-            ),
-            "original_question": (
-                "ALTER TABLE questions ADD COLUMN original_question "
-                "TEXT NOT NULL DEFAULT ''"
-            ),
-            "original_answer": (
-                "ALTER TABLE questions ADD COLUMN original_answer "
-                "TEXT NOT NULL DEFAULT ''"
-            ),
-            "review_status": (
-                "ALTER TABLE questions ADD COLUMN review_status "
-                "TEXT NOT NULL DEFAULT 'NEEDS_REVIEW'"
-            ),
-            "generation_run_id": (
-                "ALTER TABLE questions ADD COLUMN generation_run_id INTEGER"
-            ),
-        }
-        for column, statement in migrations.items():
-            if column not in question_columns:
-                connection.execute(statement)
-        run_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(generation_runs)")
-        }
-        if "needs_review_count" not in run_columns:
-            connection.execute(
-                "ALTER TABLE generation_runs ADD COLUMN "
-                "needs_review_count INTEGER NOT NULL DEFAULT 0"
-            )
+        for statement in pending:
+            connection.execute(statement)
 
 
 def add_source(title: str, content: str) -> int:
@@ -143,12 +211,45 @@ def add_source(title: str, content: str) -> int:
         return int(cursor.lastrowid)
 
 
+_SOURCE_COLUMNS = (
+    "id, title, content, created_at, official_title, document_number, "
+    "adoption_date, source_url"
+)
+
+
 def list_sources() -> list[dict[str, Any]]:
     with _database() as connection:
         rows = connection.execute(
-            "SELECT id, title, content, created_at FROM sources ORDER BY id DESC"
+            f"SELECT {_SOURCE_COLUMNS} FROM sources ORDER BY id DESC"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_source(source_id: int) -> dict[str, Any] | None:
+    with _database() as connection:
+        row = connection.execute(
+            f"SELECT {_SOURCE_COLUMNS} FROM sources WHERE id = ?", (source_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_source_metadata(source_id: int, **metadata: str) -> bool:
+    """Set legal-act metadata entered by the administrator (never by the AI).
+
+    Only the metadata columns change; the stored document text is untouched.
+    """
+    unknown = set(metadata) - set(SOURCE_METADATA_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown metadata fields: {sorted(unknown)}")
+    if not metadata:
+        return False
+    assignments = ", ".join(f"{field} = ?" for field in metadata)
+    with _database() as connection:
+        cursor = connection.execute(
+            f"UPDATE sources SET {assignments} WHERE id = ?",
+            (*metadata.values(), source_id),
+        )
+        return cursor.rowcount == 1
 
 
 def get_sources_by_ids(source_ids: list[int]) -> list[dict[str, Any]]:
@@ -157,7 +258,7 @@ def get_sources_by_ids(source_ids: list[int]) -> list[dict[str, Any]]:
     placeholders = ",".join("?" for _ in source_ids)
     with _database() as connection:
         rows = connection.execute(
-            f"SELECT id, title, content, created_at FROM sources "
+            f"SELECT {_SOURCE_COLUMNS} FROM sources "
             f"WHERE id IN ({placeholders})",
             source_ids,
         ).fetchall()
@@ -267,8 +368,9 @@ def save_generation_collection(
     sections_total: int,
     questions: list[dict[str, Any]],
     duplicates_removed: int,
+    skipped_items: list[dict[str, Any]] | None = None,
 ) -> tuple[int, list[int]]:
-    """Atomically save a complete run and its draft questions."""
+    """Atomically save a complete run, its drafts and its skipped Q&A pairs."""
     now = _now()
     unverified_count = sum(not question["source_verified"] for question in questions)
     needs_review_count = sum(
@@ -306,8 +408,11 @@ def save_generation_collection(
                     source_verified, source_review_note, generation_run_id,
                     source_excerpt, document_type, original_question,
                     original_answer, review_status,
+                    legal_basis, section_start, section_end, quote_start,
+                    quote_end, legal_article, legal_part, legal_clause,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     question["question"],
@@ -325,12 +430,51 @@ def save_generation_collection(
                     question.get("original_question", ""),
                     question.get("original_answer", ""),
                     question.get("review_status", "NEEDS_REVIEW"),
+                    question.get("legal_basis", ""),
+                    question.get("section_start"),
+                    question.get("section_end"),
+                    question.get("quote_start"),
+                    question.get("quote_end"),
+                    question.get("legal_article", ""),
+                    question.get("legal_part", ""),
+                    question.get("legal_clause", ""),
                     now,
                     now,
                 ),
             )
             question_ids.append(int(cursor.lastrowid))
+        for item in skipped_items or []:
+            connection.execute(
+                """
+                INSERT INTO skipped_items (
+                    generation_run_id, source_id, source_title, source_reference,
+                    section_start, section_end, original_question,
+                    original_answer, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    item.get("source_id"),
+                    item.get("source_title", ""),
+                    item.get("source_reference", ""),
+                    item.get("section_start"),
+                    item.get("section_end"),
+                    item.get("original_question", ""),
+                    item.get("original_answer", ""),
+                    item["reason"],
+                    now,
+                ),
+            )
     return run_id, question_ids
+
+
+def list_skipped_items(generation_run_id: int) -> list[dict[str, Any]]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM skipped_items WHERE generation_run_id = ? ORDER BY id",
+            (generation_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def set_question_status(question_id: int, status: str) -> bool:
@@ -361,7 +505,13 @@ def update_question(
     source_verified: bool,
     source_review_note: str,
     review_status: str,
+    quote_start: int | None = None,
+    quote_end: int | None = None,
+    legal_article: str = "",
+    legal_part: str = "",
+    legal_clause: str = "",
 ) -> bool:
+    """Update a pending draft. Original Q&A text and source links stay unchanged."""
     with _database() as connection:
         cursor = connection.execute(
             """
@@ -369,7 +519,8 @@ def update_question(
             SET question = ?, options_json = ?, correct_index = ?,
                 source_title = ?, source_reference = ?, source_quote = ?,
                 source_verified = ?, source_review_note = ?,
-                review_status = ?,
+                review_status = ?, quote_start = ?, quote_end = ?,
+                legal_article = ?, legal_part = ?, legal_clause = ?,
                 updated_at = ?
             WHERE id = ? AND status = 'pending'
             """,
@@ -383,6 +534,11 @@ def update_question(
                 int(source_verified),
                 source_review_note,
                 review_status,
+                quote_start,
+                quote_end,
+                legal_article,
+                legal_part,
+                legal_clause,
                 _now(),
                 question_id,
             ),
