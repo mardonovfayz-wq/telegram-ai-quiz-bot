@@ -82,7 +82,32 @@ class PrivateChatOnlyTests(unittest.TestCase):
         )
 
     def _matching(self, update):
-        return [handler for handler in self.handlers if handler.check_update(update)]
+        from telegram.ext import CommandHandler
+
+        matched = []
+        for handler in self.handlers:
+            if isinstance(handler, CommandHandler):
+                # CommandHandler.check_update needs a live bot username, so
+                # check its update filter and command name directly instead.
+                message = update.effective_message
+                text = (message.text or "") if message else ""
+                command = text.split()[0][1:].split("@")[0].lower() if text.startswith("/") else ""
+                if command in handler.commands and handler.filters.check_update(update):
+                    matched.append(handler)
+            elif handler.check_update(update):
+                matched.append(handler)
+        return matched
+
+    def test_every_command_uses_the_private_message_filter(self):
+        from telegram.ext import CommandHandler
+
+        commands = [handler for handler in self.handlers if isinstance(handler, CommandHandler)]
+        self.assertEqual(
+            sorted(name for handler in commands for name in handler.commands),
+            sorted(self.bot.COMMANDS),
+        )
+        for handler in commands:
+            self.assertIs(handler.filters, self.bot.PRIVATE_MESSAGES)
 
     def test_channel_posts_reach_no_handler(self):
         for text in ("Kanaldagi oddiy post", "/start", "/generate 10"):
