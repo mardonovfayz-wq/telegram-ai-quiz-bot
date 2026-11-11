@@ -108,6 +108,10 @@ class PrivateChatOnlyTests(unittest.TestCase):
         )
         for handler in commands:
             self.assertIs(handler.filters, self.bot.PRIVATE_MESSAGES)
+            # Only generation runs in the background; everything else is sequential.
+            self.assertEqual(handler.block, "generate" not in handler.commands)
+        self.assertIn("coverage", self.bot.COMMANDS)
+        self.assertIn("recheck", self.bot.COMMANDS)
 
     def test_channel_posts_reach_no_handler(self):
         for text in ("Kanaldagi oddiy post", "/start", "/generate 10"):

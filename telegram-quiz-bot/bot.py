@@ -24,6 +24,7 @@ from telegram.ext import (
     filters,
 )
 
+import pipeline
 import storage
 from bot_helpers import (
     build_poll_explanation,
@@ -31,6 +32,7 @@ from bot_helpers import (
     format_question as _format_question,
     parse_admin_id,
     parse_channel_id,
+    parse_generate_args,
     parse_question_edit,
     parse_schedule,
     parse_source_metadata,
@@ -79,7 +81,10 @@ HELP_TEXT = (
     "Telegram AI Quiz Bot buyruqlari:\n"
     "/start — botni boshlash\n"
     "/upload — PDF, DOCX, TXT yoki oddiy matn yuborish rejimi\n"
-    "/generate [son] — manbalardan savollar yaratish (standart: 10)\n"
+    "/generate [son] — keyingi ishlatilmagan bo‘limlardan savollar (standart: 10)\n"
+    "/generate full [son] — barcha bo‘limlarni qaytadan ko‘rib chiqish (eski usul)\n"
+    "/coverage — har bir manbaning qaysi bo‘limlari ishlatilgani\n"
+    "/recheck — kutayotgan va tasdiqlangan savollar havolalarini qayta tekshirish (hech narsa o‘zgarmaydi)\n"
     "/questions [holat] [sahifa] — savollarni ko‘rish\n"
     "/sources — manbalar ro‘yxati va huquqiy hujjat ma’lumotlari\n"
     "/setmeta <ID> — manbaga rasmiy nom, raqam, sana va havola kiritish\n"
@@ -197,6 +202,14 @@ async def handle_document(
         if len(file_bytes) > MAX_FILE_BYTES:
             raise ValueError("Fayl 20 MB dan katta.")
         content = extract_document(filename, file_bytes)
+        existing = storage.find_source_by_content(content)
+        if existing:
+            context.user_data["awaiting_upload"] = False
+            await update.effective_message.reply_text(
+                f"Bu matn allaqachon yuklangan: {existing['title']} "
+                f"(ID: {existing['id']}). Qayta saqlanmadi."
+            )
+            return
         source_id = storage.add_source(filename, content)
         context.user_data["awaiting_upload"] = False
         await update.effective_message.reply_text(
@@ -237,6 +250,14 @@ async def handle_text(
         try:
             content = prepare_plain_text(text)
             title = "Telegram matni"
+            existing = storage.find_source_by_content(content)
+            if existing:
+                context.user_data["awaiting_upload"] = False
+                await message.reply_text(
+                    f"Bu matn allaqachon yuklangan (ID: {existing['id']}). "
+                    "Qayta saqlanmadi."
+                )
+                return
             source_id = storage.add_source(title, content)
             context.user_data["awaiting_upload"] = False
             await message.reply_text(
@@ -323,20 +344,190 @@ async def save_source_metadata(
     )
 
 
+TELEGRAM_TEXT_LIMIT = 4000
+
+
+def _fit_message(text: str) -> str:
+    if len(text) <= TELEGRAM_TEXT_LIMIT:
+        return text
+    return text[: TELEGRAM_TEXT_LIMIT - 40].rstrip() + "\n… (xabar qisqartirildi)"
+
+
 async def generate_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Runs in the background (block=False) so other commands keep working."""
+    if not await is_authorized_admin(update, context):
+        return
+    try:
+        mode, count = parse_generate_args(context.args)
+    except ValueError as error:
+        await update.effective_message.reply_text(str(error))
+        return
+    lock = context.application.bot_data.setdefault("generation_lock", asyncio.Lock())
+    if lock.locked():
+        await update.effective_message.reply_text(
+            "Generatsiya allaqachon ishlayapti. U tugagach qayta urinib ko‘ring."
+        )
+        return
+    async with lock:
+        if mode == "full":
+            await _run_full_generation(update, context, count)
+        else:
+            await _run_incremental_generation(update, context, count)
+
+
+async def _send_review_cards(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, question_ids: list[int]
+) -> int:
+    failures = 0
+    for question_id in question_ids:
+        try:
+            await send_question_card(update.effective_chat.id, context, question_id)
+        except Exception as error:
+            failures += 1
+            logger.warning(
+                "Could not send review card #%s: %s", question_id, type(error).__name__
+            )
+    return failures
+
+
+async def _run_incremental_generation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, count: int
+) -> None:
+    progress = await update.effective_message.reply_text(
+        f"Keyingi ishlatilmagan bo‘limlardan {count} ta savol tayyorlanmoqda…"
+    )
+
+    async def show_progress(processed: int, total: int, draft_count: int) -> None:
+        try:
+            await progress.edit_text(
+                f"Bo‘limlar: {processed} ta ko‘rildi (navbatda {total} ta). "
+                f"Tayyor qoralamalar: {draft_count}/{count}."
+            )
+        except TelegramError:
+            logger.info("Could not update Telegram generation progress.")
+
+    try:
+        result = await pipeline.run_incremental_generation(
+            openai_client, count, progress_callback=show_progress
+        )
+    except ValueError as error:
+        await progress.edit_text(str(error))
+        return
+    except Exception as error:
+        logger.warning("Incremental generation failed: %s", type(error).__name__)
+        await progress.edit_text(
+            "Savollar yaratilmadi. Manba matni yoki tarmoqni tekshirib, qayta urinib ko‘ring."
+        )
+        return
+    if result["nothing_left"]:
+        await progress.edit_text(
+            "Barcha bo‘limlar allaqachon ishlatilgan. Yangi manba yuklang "
+            "yoki /coverage orqali holatni ko‘ring."
+        )
+        return
+
+    delivery_failures = await _send_review_cards(update, context, result["question_ids"])
+    lines = [
+        f"To‘plam #{result['run_id']} saqlandi (bosqichma-bosqich rejim).",
+        f"Qoralamalar: {len(result['questions'])}/{count}",
+        f"Ko‘rilgan bo‘limlar: {result['sections_processed']}",
+        f"Tasdiqlashga tayyor: {result['ready_for_approval']}",
+        f"NEEDS_REVIEW: {result['needs_review']}",
+        f"Takroriy savollar olib tashlandi: {result['duplicates_removed']}",
+        f"Hali ishlatilmagan bo‘limlar: {result['sections_remaining']}",
+    ]
+    if result["unsuitable_count"]:
+        lines.append(
+            "Quiz uchun yaroqsiz (o‘zgartirilmay saqlangan) asl savol-javoblar: "
+            f"{result['unsuitable_count']}"
+        )
+    if result["sections_failed"]:
+        lines.append(
+            f"Xato bergan bo‘limlar: {result['sections_failed']} "
+            "(keyingi /generate da qayta urinib ko‘riladi). "
+            f"Sabab: {result['failed_reasons'][0]}"
+        )
+    if result["stopped_early"]:
+        lines.append(
+            "Ketma-ket xatolar sababli jarayon erta to‘xtadi; tayyor qoralamalar saqlandi."
+        )
+    if delivery_failures:
+        lines.append(
+            f"Yuborilmagan kartalar: {delivery_failures}. /questions pending orqali ko‘ring."
+        )
+    lines.append(
+        "\nHar bir savol administrator tasdiqlamaguncha kanalga chiqmaydi."
+    )
+    try:
+        await progress.edit_text(_fit_message("\n".join(lines)))
+    except TelegramError:
+        logger.info("Could not send the final generation summary.")
+
+
+async def coverage_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     if not await is_authorized_admin(update, context):
         return
-    if len(context.args) > 1:
-        await update.effective_message.reply_text("Foydalanish: /generate [son]")
-        return
     try:
-        count = int(context.args[0]) if context.args else 10
-    except ValueError:
-        await update.effective_message.reply_text("Savollar sonini raqam bilan kiriting.")
+        pipeline.eligible_sections()  # registers sections of new sources
+    except Exception as error:
+        logger.warning("Coverage sync failed: %s", type(error).__name__)
+    summary = storage.coverage_summary()
+    if not summary:
+        await update.effective_message.reply_text("Hozircha manba yo‘q.")
         return
+    lines = []
+    for item in summary[:20]:
+        name = item["official_title"] or item["title"]
+        lines.append(
+            f"ID {item['source_id']}: {name}\n"
+            f"  jami {item['total']} · ishlatilgan {item['used']} · "
+            f"savolsiz {item['empty']} · yaroqsiz Q&A {item['unsuitable']} · "
+            f"xato {item['failed']} (shundan yakuniy {item['failed_final']}) · "
+            f"navbatda {item['unused']}"
+        )
+    note = "\n(birinchi 20 ta manba ko‘rsatildi)" if len(summary) > 20 else ""
+    await update.effective_message.reply_text(
+        _fit_message("Manbalar qamrovi:\n" + "\n".join(lines) + note)
+    )
 
+
+async def recheck_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await is_authorized_admin(update, context):
+        return
+    report = pipeline.recheck_questions()
+    header = (
+        f"Qayta tekshiruv (bazada hech narsa o‘zgartirilmadi):\n"
+        f"Tekshirildi: {report['checked']} · mos: {report['ok']} · "
+        f"muammoli: {len(report['problems'])}"
+    )
+    if not report["problems"]:
+        await update.effective_message.reply_text(header)
+        return
+    details = "\n".join(
+        f"#{item['id']} ({item['status']}) {item['reference']}: {item['note']}"
+        for item in report["problems"][:15]
+    )
+    more = (
+        f"\n… va yana {len(report['problems']) - 15} ta"
+        if len(report["problems"]) > 15
+        else ""
+    )
+    await update.effective_message.reply_text(
+        _fit_message(f"{header}\n\n{details}{more}\n\n"
+        "Muammoli savollarni ko‘rib chiqing; tasdiqlanganlarini nashrdan oldin "
+        "tekshirish tavsiya etiladi.")
+    )
+
+
+async def _run_full_generation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, count: int
+) -> None:
     sources = storage.list_sources()
     progress = await update.effective_message.reply_text(
         "Manbalar bo‘limlarga ajratilmoqda. Hech bir bo‘lim tashlab ketilmaydi."
@@ -793,6 +984,8 @@ COMMANDS = {
     "help": help_command,
     "upload": upload_command,
     "generate": generate_command,
+    "coverage": coverage_command,
+    "recheck": recheck_command,
     "questions": questions_command,
     "sources": sources_command,
     "setmeta": setmeta_command,
@@ -805,7 +998,13 @@ ALLOWED_UPDATES = [Update.MESSAGE, Update.CALLBACK_QUERY]
 def register_handlers(application: Application) -> None:
     for name, callback in COMMANDS.items():
         application.add_handler(
-            CommandHandler(name, callback, filters=PRIVATE_MESSAGES)
+            CommandHandler(
+                name,
+                callback,
+                filters=PRIVATE_MESSAGES,
+                # Generation runs in the background so the bot stays responsive.
+                block=name != "generate",
+            )
         )
     application.add_handler(
         CallbackQueryHandler(

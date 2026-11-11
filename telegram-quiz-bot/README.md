@@ -77,8 +77,14 @@ file contains placeholders only.
 
 - `/start` — start and show the command list.
 - `/upload` — enter source-upload mode, then send a PDF, DOCX, TXT, or plain text.
-- `/generate` — process every saved section; request a target of ten questions.
-- `/generate 3` — process every saved section; request a target of three questions.
+- `/generate` — create up to ten drafts from the next **unused** sections.
+- `/generate 3` — the same, up to three drafts.
+- `/generate full 10` — the previous behaviour: re-process every section of
+  every source.
+- `/coverage` — per source: sections used, without questions, unsuitable Q&A,
+  failed (and failed for good after 3 attempts) and still waiting.
+- `/recheck` — re-check the citations of pending and approved questions with
+  the current rules. Read-only: it only reports, nothing is changed.
 - `/questions` — review the first page of pending questions.
 - `/questions pending 2` — review the second page of pending questions.
 - `/questions approved` — list approved questions waiting for the schedule.
@@ -95,6 +101,28 @@ Schedule times use 24-hour `HH:MM` format and `Asia/Tashkent` time by default.
 The number of times must equal the number of daily quizzes. For example,
 `/schedule 1 10:30` sets one quiz per day. If there are no approved questions
 when a scheduled time arrives, nothing is published.
+
+### How `/generate` chooses material
+
+The bot keeps a ledger of every section of every source. `/generate N` walks
+through sections that have not been used yet, in document order (oldest source
+first), and stops once it has N drafts; the next run continues where it
+stopped, so the same material is not used twice. Uploading exactly the same
+text again is refused.
+
+If a section fails (for example an OpenAI timeout), the drafts already made
+are still saved, the section is marked as failed and retried on a later run
+(at most 3 attempts in total). After 3 failures in a row the run stops early
+and keeps what it has. Generation runs in the background, so other commands
+keep working; only one generation can run at a time.
+
+Every new draft gets a second, independent AI check: does the quote alone
+support the marked answer? If not, or if the check itself fails, the draft is
+marked NEEDS_REVIEW. This check can only make a draft stricter; it never
+approves or changes anything. Q&A drafts skip it because the source states the
+question and answer itself. Nothing is generated automatically on a schedule.
+
+### `/generate full`
 
 The requested question count is a target. If the document has more sections than
 the target, the bot still checks every section and may create more questions so
@@ -154,6 +182,10 @@ document's answer bank are flagged for administrator review.
 - `legal_refs.py` — strict legal locators, article/part/clause structure and
   citation checks.
 - `bot_helpers.py` — parsing and formatting used by the bot (testable offline).
+- `pipeline.py` — incremental generation with the section ledger, and the
+  read-only citation re-check.
+- `tests/test_pipeline.py` — ledger, incremental runs, failure tolerance,
+  answer-support check, duplicate uploads and the read-only re-check.
 - `tests/test_large_documents.py` — offline chunking, Q&A preservation, citation,
   retry/repair, deduplication, migration, and approval-gate tests.
 - `tests/test_legal_accuracy.py` — strict article matching, three-script legal

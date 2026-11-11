@@ -1,5 +1,6 @@
 """Small SQLite helpers for the Telegram quiz bot."""
 
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,10 @@ DB_PATH = Path(
     or Path(__file__).with_name("quiz_bot.sqlite3")
 )
 logger = logging.getLogger(__name__)
+
+# A failed section is retried on later runs at most this many times in total.
+MAX_SECTION_ATTEMPTS = 3
+SECTION_STATUSES = ("unused", "used", "empty", "unsuitable", "failed")
 
 SOURCE_METADATA_FIELDS = (
     "official_title",
@@ -68,8 +73,20 @@ _QUESTION_MIGRATIONS = {
 _SOURCE_MIGRATIONS = {
     field: "TEXT NOT NULL DEFAULT ''" for field in SOURCE_METADATA_FIELDS
 }
-_RUN_MIGRATIONS = {"needs_review_count": "INTEGER NOT NULL DEFAULT 0"}
-_EXPECTED_TABLES = {"sources", "generation_runs", "questions", "skipped_items", "settings"}
+_SOURCE_MIGRATIONS["content_sha256"] = "TEXT NOT NULL DEFAULT ''"
+_RUN_MIGRATIONS = {
+    "needs_review_count": "INTEGER NOT NULL DEFAULT 0",
+    "mode": "TEXT NOT NULL DEFAULT 'full'",
+    "failed_sections": "INTEGER NOT NULL DEFAULT 0",
+}
+_EXPECTED_TABLES = {
+    "sources",
+    "generation_runs",
+    "questions",
+    "skipped_items",
+    "settings",
+    "source_sections",
+}
 
 
 def _pending_migrations(connection: sqlite3.Connection, tables: set[str]) -> list[str]:
@@ -132,7 +149,24 @@ def initialize_database() -> None:
                 official_title TEXT NOT NULL DEFAULT '',
                 document_number TEXT NOT NULL DEFAULT '',
                 adoption_date TEXT NOT NULL DEFAULT '',
-                source_url TEXT NOT NULL DEFAULT ''
+                source_url TEXT NOT NULL DEFAULT '',
+                content_sha256 TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS source_sections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL REFERENCES sources(id),
+                section_number INTEGER NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                section_sha256 TEXT NOT NULL,
+                section_kind TEXT NOT NULL DEFAULT 'prose',
+                status TEXT NOT NULL DEFAULT 'unused',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                last_run_id INTEGER,
+                updated_at TEXT NOT NULL,
+                UNIQUE (source_id, start_offset, end_offset, section_sha256)
             );
 
             CREATE TABLE IF NOT EXISTS generation_runs (
@@ -144,7 +178,9 @@ def initialize_database() -> None:
                 duplicates_removed INTEGER NOT NULL DEFAULT 0,
                 unverified_count INTEGER NOT NULL DEFAULT 0,
                 needs_review_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'full',
+                failed_sections INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS questions (
@@ -202,13 +238,40 @@ def initialize_database() -> None:
             connection.execute(statement)
 
 
+def content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def add_source(title: str, content: str) -> int:
     with _database() as connection:
         cursor = connection.execute(
-            "INSERT INTO sources (title, content, created_at) VALUES (?, ?, ?)",
-            (title, content, _now()),
+            "INSERT INTO sources (title, content, created_at, content_sha256) "
+            "VALUES (?, ?, ?, ?)",
+            (title, content, _now(), content_hash(content)),
         )
         return int(cursor.lastrowid)
+
+
+def find_source_by_content(content: str) -> dict[str, Any] | None:
+    """An already uploaded source with exactly the same extracted text.
+
+    Older rows have no stored hash; their hash is computed in memory and the
+    rows themselves are not modified.
+    """
+    digest = content_hash(content)
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT id, title FROM sources WHERE content_sha256 = ? ORDER BY id LIMIT 1",
+            (digest,),
+        ).fetchone()
+        if row:
+            return dict(row)
+        for legacy in connection.execute(
+            "SELECT id, title, content FROM sources WHERE content_sha256 = '' ORDER BY id"
+        ):
+            if content_hash(legacy["content"]) == digest:
+                return {"id": legacy["id"], "title": legacy["title"]}
+    return None
 
 
 _SOURCE_COLUMNS = (
@@ -369,8 +432,11 @@ def save_generation_collection(
     questions: list[dict[str, Any]],
     duplicates_removed: int,
     skipped_items: list[dict[str, Any]] | None = None,
+    mode: str = "full",
+    failed_sections: int = 0,
+    section_outcomes: list[dict[str, Any]] | None = None,
 ) -> tuple[int, list[int]]:
-    """Atomically save a complete run, its drafts and its skipped Q&A pairs."""
+    """Atomically save a run, its drafts, skipped Q&A pairs and ledger updates."""
     now = _now()
     unverified_count = sum(not question["source_verified"] for question in questions)
     needs_review_count = sum(
@@ -383,18 +449,20 @@ def save_generation_collection(
             INSERT INTO generation_runs (
                 source_count, sections_total, sections_processed,
                 question_count, duplicates_removed, unverified_count,
-                needs_review_count, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                needs_review_count, created_at, mode, failed_sections
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_count,
                 sections_total,
-                sections_total,
+                sections_total - failed_sections,
                 len(questions),
                 duplicates_removed,
                 unverified_count,
                 needs_review_count,
                 now,
+                mode,
+                failed_sections,
             ),
         )
         run_id = int(run_cursor.lastrowid)
@@ -463,6 +531,25 @@ def save_generation_collection(
                     item.get("original_answer", ""),
                     item["reason"],
                     now,
+                ),
+            )
+        for outcome in section_outcomes or []:
+            if outcome["status"] not in SECTION_STATUSES:
+                raise ValueError(f"Unknown section status: {outcome['status']}")
+            connection.execute(
+                """
+                UPDATE source_sections
+                SET status = ?, last_error = ?, last_run_id = ?, updated_at = ?,
+                    attempts = attempts + ?
+                WHERE id = ?
+                """,
+                (
+                    outcome["status"],
+                    (outcome.get("error") or "")[:500],
+                    run_id,
+                    now,
+                    1 if outcome["status"] == "failed" else 0,
+                    outcome["ledger_id"],
                 ),
             )
     return run_id, question_ids
@@ -563,6 +650,151 @@ def mark_question_published(question_id: int, message_id: int) -> bool:
             (message_id, _now(), question_id),
         )
         return cursor.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Section ledger: which parts of each source have already been used.
+# ---------------------------------------------------------------------------
+
+
+def section_hash(excerpt: str) -> str:
+    return hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+
+
+def sync_source_sections(
+    source_id: int, sections: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Register the current sections of a source and return their ledger rows.
+
+    Sections are identified by offsets and text hash, so re-splitting the same
+    text finds the same rows. Existing ledger rows are never reset.
+    """
+    now = _now()
+    keys = []
+    with _database() as connection:
+        for section in sections:
+            digest = section_hash(section["source_excerpt"])
+            key = (source_id, section["start"], section["end"], digest)
+            keys.append(key)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO source_sections (
+                    source_id, section_number, start_offset, end_offset,
+                    section_sha256, section_kind, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    section["section_number"],
+                    section["start"],
+                    section["end"],
+                    digest,
+                    section.get("section_kind", "prose"),
+                    now,
+                ),
+            )
+        rows = connection.execute(
+            "SELECT * FROM source_sections WHERE source_id = ? ORDER BY start_offset, id",
+            (source_id,),
+        ).fetchall()
+    wanted = set(keys)
+    return [
+        dict(row)
+        for row in rows
+        if (row["source_id"], row["start_offset"], row["end_offset"], row["section_sha256"])
+        in wanted
+    ]
+
+
+def section_is_eligible(row: dict[str, Any]) -> bool:
+    return row["status"] == "unused" or (
+        row["status"] == "failed" and row["attempts"] < MAX_SECTION_ATTEMPTS
+    )
+
+
+def save_incremental_run(
+    source_count: int,
+    questions: list[dict[str, Any]],
+    duplicates_removed: int,
+    skipped_items: list[dict[str, Any]],
+    section_outcomes: list[dict[str, Any]],
+) -> tuple[int, list[int]]:
+    """Atomically save drafts, skipped pairs and ledger updates for one run.
+
+    ``section_outcomes`` items: {"ledger_id", "status", "error"}; a "failed"
+    outcome increases the attempt counter so the section is retried later.
+    """
+    failed = sum(item["status"] == "failed" for item in section_outcomes)
+    run_id, question_ids = save_generation_collection(
+        source_count=source_count,
+        sections_total=len(section_outcomes),
+        questions=questions,
+        duplicates_removed=duplicates_removed,
+        skipped_items=skipped_items,
+        mode="incremental",
+        failed_sections=failed,
+        section_outcomes=section_outcomes,
+    )
+    return run_id, question_ids
+
+
+def coverage_summary() -> list[dict[str, Any]]:
+    """Per-source counts of ledger sections by status."""
+    with _database() as connection:
+        rows = connection.execute(
+            """
+            SELECT s.id AS source_id, s.title, s.official_title,
+                   ss.status, ss.attempts, COUNT(ss.id) AS amount
+            FROM sources s
+            LEFT JOIN source_sections ss ON ss.source_id = s.id
+            GROUP BY s.id, ss.status, ss.attempts >= ?
+            ORDER BY s.id
+            """,
+            (MAX_SECTION_ATTEMPTS,),
+        ).fetchall()
+    summary: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        entry = summary.setdefault(
+            row["source_id"],
+            {
+                "source_id": row["source_id"],
+                "title": row["title"],
+                "official_title": row["official_title"],
+                "total": 0,
+                **{status: 0 for status in SECTION_STATUSES},
+                "failed_final": 0,
+            },
+        )
+        if row["status"] is None:
+            continue
+        entry["total"] += row["amount"]
+        entry[row["status"]] += row["amount"]
+        if row["status"] == "failed" and row["attempts"] >= MAX_SECTION_ATTEMPTS:
+            entry["failed_final"] += row["amount"]
+    return list(summary.values())
+
+
+def list_failed_sections(limit: int = 20) -> list[dict[str, Any]]:
+    with _database() as connection:
+        rows = connection.execute(
+            """
+            SELECT ss.*, s.title FROM source_sections ss
+            JOIN sources s ON s.id = ss.source_id
+            WHERE ss.status = 'failed' ORDER BY ss.updated_at DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_questions_for_recheck(statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in statuses)
+    with _database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM questions WHERE status IN ({placeholders}) ORDER BY id",
+            statuses,
+        ).fetchall()
+    return [_question_from_row(row) for row in rows]
 
 
 def save_schedule(daily_times: list[str]) -> None:

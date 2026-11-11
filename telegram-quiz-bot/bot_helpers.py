@@ -110,6 +110,27 @@ def differs_from_original_pair(question: dict) -> bool:
     ) != normalize(original_answer)
 
 
+GENERATE_USAGE = "Foydalanish: /generate [son] yoki /generate full [son]"
+
+
+def parse_generate_args(args: list[str]) -> tuple[str, int]:
+    """('incremental' | 'full', count) from /generate arguments."""
+    mode = "incremental"
+    values = list(args)
+    if values and values[0].lower() == "full":
+        mode = "full"
+        values = values[1:]
+    if len(values) > 1:
+        raise ValueError(GENERATE_USAGE)
+    try:
+        count = int(values[0]) if values else 10
+    except ValueError as error:
+        raise ValueError("Savollar sonini raqam bilan kiriting.") from error
+    if not 1 <= count <= 20:
+        raise ValueError("Bir so‘rovda 1 dan 20 tagacha savol so‘rash mumkin.")
+    return mode, count
+
+
 # ---------------------------------------------------------------------------
 # Publishing schedule.
 # ---------------------------------------------------------------------------

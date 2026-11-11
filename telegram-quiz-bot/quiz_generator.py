@@ -882,6 +882,88 @@ def shuffle_options(
     return shuffled, new_index
 
 
+def _finalize_candidate(
+    section: dict[str, Any],
+    candidate: dict[str, Any],
+    source_record: dict[str, Any],
+    rng: random.Random | None,
+) -> dict[str, Any]:
+    """Verify the citation, shuffle options and attach source links/review state."""
+    citation = check_citation(
+        section["source_title"],
+        candidate["source_reference"],
+        candidate["source_quote"],
+        [source_record],
+        scope=(section["start"], section["end"]),
+    )
+    verified, review_note = citation.verified, citation.note
+    if verified and citation.canonical_reference:
+        # Store the location derived from the document itself.
+        candidate["source_reference"] = citation.canonical_reference
+    candidate["options"], candidate["correct_index"] = shuffle_options(
+        candidate["options"], candidate["correct_index"], rng
+    )
+    if len(candidate["source_reference"]) > POLL_REFERENCE_MAX_CHARS:
+        verified = False
+        review_note = (
+            "Havola Telegram quiz izohiga sig‘maydi; "
+            "administrator aniqroq manba belgisini tekshirsin."
+        )
+    document_type = section.get("document_type", "unknown")
+    needs_review = not verified
+    if document_type in {"mixed", "unknown"}:
+        needs_review = True
+        review_note = (
+            review_note
+            or "Hujjat turi aralash yoki noma’lum; administrator mazmunni tekshirsin."
+        )
+    if not candidate.get("distractors_grounded", True):
+        needs_review = True
+        review_note = (
+            review_note
+            or "Q/A distractorlari javoblar bankida topilmadi; administrator tekshirsin."
+        )
+    candidate.update(
+        {
+            "source_id": section["source_id"],
+            "source_ids": [section["source_id"]],
+            "source_title": section["source_title"],
+            "source_verified": verified,
+            "source_review_note": review_note if needs_review else "",
+            "source_excerpt": section["source_excerpt"],
+            "document_type": document_type,
+            "original_question": section.get("original_question", ""),
+            "original_answer": section.get("original_answer", ""),
+            "legal_basis": section.get("legal_basis", ""),
+            "section_start": section["start"],
+            "section_end": section["end"],
+            "quote_start": citation.quote_start,
+            "quote_end": citation.quote_end,
+            "legal_article": citation.article or "",
+            "legal_part": citation.part or "",
+            "legal_clause": citation.clause or "",
+            "review_status": (
+                "NEEDS_REVIEW" if needs_review else "READY_FOR_APPROVAL"
+            ),
+        }
+    )
+    return candidate
+
+
+def _unsuitable_item(section: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "source_id": section["source_id"],
+        "source_title": section["source_title"],
+        "section_number": section["section_number"],
+        "section_start": section["start"],
+        "section_end": section["end"],
+        "source_reference": section.get("source_reference", ""),
+        "original_question": section.get("original_question", ""),
+        "original_answer": section.get("original_answer", ""),
+        "reason": reason,
+    }
+
+
 async def generate_questions(
     client: AsyncOpenAI,
     sources: list[dict[str, Any]],
@@ -942,19 +1024,7 @@ async def generate_questions(
                 reason = qa_poll_unsuitability(section)
                 if reason:
                     # Report it; never shorten or rewrite the original pair.
-                    unsuitable_items.append(
-                        {
-                            "source_id": section["source_id"],
-                            "source_title": section["source_title"],
-                            "section_number": section["section_number"],
-                            "section_start": section["start"],
-                            "section_end": section["end"],
-                            "source_reference": section.get("source_reference", ""),
-                            "original_question": section.get("original_question", ""),
-                            "original_answer": section.get("original_answer", ""),
-                            "reason": reason,
-                        }
-                    )
+                    unsuitable_items.append(_unsuitable_item(section, reason))
                     processed_sections += 1
                     if progress_callback:
                         await progress_callback(
@@ -975,64 +1045,7 @@ async def generate_questions(
             if not candidates:
                 empty_section_count += 1
             for candidate in candidates:
-                citation = check_citation(
-                    section["source_title"],
-                    candidate["source_reference"],
-                    candidate["source_quote"],
-                    [source_record],
-                    scope=(section["start"], section["end"]),
-                )
-                verified, review_note = citation.verified, citation.note
-                if verified and citation.canonical_reference:
-                    # Store the location derived from the document itself.
-                    candidate["source_reference"] = citation.canonical_reference
-                candidate["options"], candidate["correct_index"] = shuffle_options(
-                    candidate["options"], candidate["correct_index"], rng
-                )
-                if len(candidate["source_reference"]) > POLL_REFERENCE_MAX_CHARS:
-                    verified = False
-                    review_note = (
-                        "Havola Telegram quiz izohiga sig‘maydi; "
-                        "administrator aniqroq manba belgisini tekshirsin."
-                    )
-                document_type = section.get("document_type", "unknown")
-                needs_review = not verified
-                if document_type in {"mixed", "unknown"}:
-                    needs_review = True
-                    review_note = (
-                        review_note
-                        or "Hujjat turi aralash yoki noma’lum; administrator mazmunni tekshirsin."
-                    )
-                if not candidate.get("distractors_grounded", True):
-                    needs_review = True
-                    review_note = (
-                        review_note
-                        or "Q/A distractorlari javoblar bankida topilmadi; administrator tekshirsin."
-                    )
-                candidate.update(
-                    {
-                        "source_id": section["source_id"],
-                        "source_ids": [section["source_id"]],
-                        "source_title": section["source_title"],
-                        "source_verified": verified,
-                        "source_review_note": review_note if needs_review else "",
-                        "source_excerpt": section["source_excerpt"],
-                        "document_type": document_type,
-                        "original_question": section.get("original_question", ""),
-                        "original_answer": section.get("original_answer", ""),
-                        "legal_basis": section.get("legal_basis", ""),
-                        "section_start": section["start"],
-                        "section_end": section["end"],
-                        "quote_start": citation.quote_start,
-                        "quote_end": citation.quote_end,
-                        "legal_article": citation.article or "",
-                        "legal_part": citation.part or "",
-                        "legal_clause": citation.clause or "",
-                        "review_status": (
-                            "NEEDS_REVIEW" if needs_review else "READY_FOR_APPROVAL"
-                        ),
-                    }
-                )
+                candidate = _finalize_candidate(section, candidate, source_record, rng)
                 if is_near_duplicate(candidate["question"], seen_questions):
                     duplicate_count += 1
                     continue
@@ -1102,4 +1115,197 @@ async def generate_questions(
         "requested_count": count,
         "unsuitable_items": unsuitable_items,
         "unsuitable_count": len(unsuitable_items),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: answer-support check and incremental, failure-tolerant generation.
+# ---------------------------------------------------------------------------
+
+MAX_QUESTIONS_PER_SECTION = 3
+MAX_CONSECUTIVE_SECTION_FAILURES = 3
+_NETWORK_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
+
+
+def describe_section_error(error: Exception) -> str:
+    if isinstance(error, _NETWORK_ERRORS):
+        return "OpenAI rate limitasi, vaqt tugashi yoki tarmoq xatosi."
+    return f"Bo‘lim javobi tekshiruvdan o‘tmadi: {str(error)[:200]}"
+
+
+async def check_answer_support(
+    client: AsyncOpenAI, question: dict[str, Any]
+) -> tuple[bool, str]:
+    """Second, independent AI check: does the quote alone support the answer?
+
+    It can only move a draft to NEEDS_REVIEW; it never approves anything and
+    never changes the question, options, quote or citation.
+    """
+    letters = ("A", "B", "C", "D")
+    options = "\n".join(
+        f"{letters[index]}) {option}" for index, option in enumerate(question["options"])
+    )
+    prompt = f"""
+Faqat quyidagi IQTIBOSga tayanib tekshiring (tashqi bilimdan foydalanmang):
+1) Belgilangan to‘g‘ri javob iqtibosdan bevosita kelib chiqadimi?
+2) Qolgan variantlar iqtibosga ko‘ra noto‘g‘rimi?
+Ikkalasi ham "ha" bo‘lsa supported=true, aks holda false. Shubha bo‘lsa false.
+
+Faqat JSON: {{"supported": true, "reason": "qisqa izoh"}}
+
+SAVOL: {question["question"]}
+VARIANTLAR:
+{options}
+TO‘G‘RI JAVOB: {letters[question["correct_index"]]}
+IQTIBOS:
+{question["source_quote"]}
+"""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Siz huquqiy test savollarini tekshiruvchisiz. Faqat berilgan "
+                "iqtibosga tayaning va shubhali holatda supported=false qaytaring."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    def validate(payload: dict[str, Any]) -> tuple[bool, str]:
+        supported = payload.get("supported")
+        if not isinstance(supported, bool):
+            raise ValueError("supported maydoni true yoki false bo‘lishi kerak.")
+        return supported, str(payload.get("reason", ""))[:300]
+
+    return await _request_with_safe_repair(client, messages, validate)
+
+
+async def _apply_answer_support_check(
+    client: AsyncOpenAI, candidate: dict[str, Any]
+) -> None:
+    if candidate["review_status"] != "READY_FOR_APPROVAL":
+        return
+    if candidate.get("original_question"):
+        # The source itself states this question and answer.
+        return
+    try:
+        supported, reason = await check_answer_support(client, candidate)
+    except Exception as error:  # the check must never stop generation
+        supported = False
+        reason = f"Javob tekshiruvi bajarilmadi ({type(error).__name__})."
+    if not supported:
+        candidate["review_status"] = "NEEDS_REVIEW"
+        candidate["source_review_note"] = (
+            "AI tekshiruvi: to‘g‘ri javob iqtibos bilan to‘liq asoslanmagan bo‘lishi "
+            f"mumkin. {reason}".strip()
+        )
+
+
+async def generate_incremental(
+    client: AsyncOpenAI,
+    sources: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    count: int,
+    existing_question_texts: list[str] | None = None,
+    progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    rng: random.Random | None = None,
+    verify_answers: bool = True,
+    max_per_section: int = MAX_QUESTIONS_PER_SECTION,
+    max_consecutive_failures: int = MAX_CONSECUTIVE_SECTION_FAILURES,
+) -> dict[str, Any]:
+    """Process the given (not yet used) sections in order until ``count`` drafts.
+
+    Unlike ``generate_questions``, a failing section does not discard the
+    run: it is reported as "failed" (to be retried later) and the next section
+    is processed. Only after several failures in a row (usually a network or
+    OpenAI outage) does the run stop early, still keeping finished drafts.
+    Each section dict must carry ``ledger_id``.
+    """
+    if not 1 <= count <= MAX_QUESTIONS_PER_REQUEST:
+        raise ValueError("Bir so‘rovda 1 dan 20 tagacha savol so‘rash mumkin.")
+    content_by_source = {item["id"]: item["content"] for item in sources}
+    answer_banks = {
+        item["id"]: [
+            pair["answer"]
+            for pair in extract_question_answer_pairs(item["content"])
+            if len(pair["answer"]) <= POLL_OPTION_MAX_CHARS
+        ]
+        for item in sources
+    }
+    seen_questions = list(existing_question_texts or [])
+    new_questions: list[dict[str, Any]] = []
+    unsuitable_items: list[dict[str, Any]] = []
+    outcomes: list[dict[str, Any]] = []
+    duplicate_count = 0
+    consecutive_failures = 0
+    stopped_early = False
+
+    for section in sections:
+        if len(new_questions) >= count:
+            break
+        outcome = {"ledger_id": section["ledger_id"], "status": "empty", "error": ""}
+        if section.get("section_kind") == "question_answer":
+            reason = qa_poll_unsuitability(section)
+            if reason:
+                unsuitable_items.append(_unsuitable_item(section, reason))
+                outcome["status"] = "unsuitable"
+                outcome["error"] = reason
+                outcomes.append(outcome)
+                continue
+        try:
+            candidates = await _generate_for_section(
+                client,
+                section,
+                min(count - len(new_questions), max_per_section),
+                answer_banks.get(section["source_id"], []),
+            )
+        except Exception as error:
+            outcome["status"] = "failed"
+            outcome["error"] = describe_section_error(error)
+            outcomes.append(outcome)
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                stopped_early = True
+                break
+            continue
+        consecutive_failures = 0
+        source_record = {
+            "id": section["source_id"],
+            "title": section["source_title"],
+            "content": content_by_source[section["source_id"]],
+        }
+        kept = 0
+        for candidate in candidates:
+            candidate = _finalize_candidate(section, candidate, source_record, rng)
+            if is_near_duplicate(candidate["question"], seen_questions):
+                duplicate_count += 1
+                continue
+            if verify_answers:
+                await _apply_answer_support_check(client, candidate)
+            new_questions.append(candidate)
+            seen_questions.append(candidate["question"])
+            kept += 1
+        outcome["status"] = "used" if kept else "empty"
+        outcomes.append(outcome)
+        if progress_callback:
+            await progress_callback(len(outcomes), len(sections), len(new_questions))
+
+    return {
+        "questions": new_questions,
+        "section_outcomes": outcomes,
+        "sections_processed": len(outcomes),
+        "sections_failed": sum(item["status"] == "failed" for item in outcomes),
+        "failed_reasons": [item["error"] for item in outcomes if item["status"] == "failed"],
+        "sections_empty": sum(item["status"] == "empty" for item in outcomes),
+        "sections_available": len(sections),
+        "stopped_early": stopped_early,
+        "duplicates_removed": duplicate_count,
+        "unsuitable_items": unsuitable_items,
+        "unsuitable_count": len(unsuitable_items),
+        "needs_review": sum(q["review_status"] == "NEEDS_REVIEW" for q in new_questions),
+        "ready_for_approval": sum(
+            q["review_status"] == "READY_FOR_APPROVAL" for q in new_questions
+        ),
+        "source_unverified": sum(not q["source_verified"] for q in new_questions),
+        "requested_count": count,
     }
