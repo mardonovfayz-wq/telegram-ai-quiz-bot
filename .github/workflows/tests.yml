@@ -71,6 +71,20 @@ jobs:
           set -eu
           docker run --rm --entrypoint sh quiz-bot:ci -c \
             'test ! -e /app/tests && ! ls /app/*.sqlite3 2>/dev/null && test ! -e /app/.env'
+      - name: Image loads the whole bot with placeholder settings
+        # Imports every module and resolves Asia/Tashkent inside the image.
+        # Placeholders only; it does not start polling or contact any service.
+        run: |
+          docker run --rm \
+            -e TELEGRAM_BOT_TOKEN=123456:offline-test-token \
+            -e OPENAI_API_KEY=offline-test-key \
+            -e ADMIN_ID=1 \
+            -e CHANNEL_ID=@offline_test_channel \
+            quiz-bot:ci python -c "import bot; print('loaded', bot.TIMEZONE.key, bot.DAILY_GENERATION_TIME)"
+
+      - name: Data folder is writable by the bot user
+        run: docker run --rm quiz-bot:ci sh -c 'touch /data/write-test && rm /data/write-test'
+
       - name: Image refuses to start without configuration
         run: |
           set -eu

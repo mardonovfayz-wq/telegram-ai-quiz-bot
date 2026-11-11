@@ -11,10 +11,10 @@ services:
     # Put real values in the panel's "Environment variables" form (or an env
     # file stored only on the server). See quiz-bot.env.example for the list.
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      ADMIN_ID: ${ADMIN_ID}
-      CHANNEL_ID: ${CHANNEL_ID}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN panelda kiritilmagan}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY panelda kiritilmagan}
+      ADMIN_ID: ${ADMIN_ID:?ADMIN_ID panelda kiritilmagan}
+      CHANNEL_ID: ${CHANNEL_ID:?CHANNEL_ID panelda kiritilmagan}
       TIMEZONE: ${TIMEZONE:-Asia/Tashkent}
       DAILY_GENERATION_TIME: ${DAILY_GENERATION_TIME:-09:00}
       HOOK_TOKEN: ${HOOK_TOKEN:-}
