@@ -13,11 +13,17 @@ administrator approves them.
   text limit.
 - Sends every section to OpenAI separately. It checks complete text coverage and
   reports the number of sections processed.
-- Creates four-option questions in Uzbek using only the current section.
+- Distinguishes explicitly labeled question–answer documents from normative
+  legal text and general material. Original Q&A wording and answers are retained;
+  normative text is chunked around legal headings and source markers.
+- Creates four-option questions in Uzbek using only the current section. The
+  exact source excerpt, document type, citation, and any original Q&A pair are
+  stored with each draft in SQLite.
 - Checks questions for exact and near duplicates against the batch and recent
   saved questions.
-- Requires an exact source quote and legal reference when they can be verified.
-  Unverified citations are clearly flagged and cannot be approved until corrected.
+- Marks uncertain source, mixed-document, or ungrounded-distractor drafts as
+  `NEEDS_REVIEW`. They cannot be approved until an administrator checks and edits
+  them; source evidence is never automatically rewritten.
 - Lets the administrator review, edit, approve, or reject every question.
 - Stores sources, generation collections, questions, approvals, and schedule
   settings in SQLite.
@@ -25,6 +31,9 @@ administrator approves them.
 - Uses `Asia/Tashkent` as the default schedule timezone.
 - Retries OpenAI rate limits, connection errors, and timeouts. If any section
   still fails, the bot reports its progress and does not save an incomplete run.
+- If an AI response has a malformed structure, the bot makes one format-only
+  repair request. If that also fails, the run stops; it never guesses or repairs
+  legal citations automatically.
 
 Telegram file downloads are limited to 20 MB per file. The removed 45,000
 character limit applied to extracted text, not the raw Telegram file size.
@@ -52,7 +61,7 @@ file contains placeholders only.
 
 - `/start` — start and show the command list.
 - `/upload` — enter source-upload mode, then send a PDF, DOCX, TXT, or plain text.
-- `/generate` — process every saved section; request a target of five questions.
+- `/generate` — process every saved section; request a target of ten questions.
 - `/generate 3` — process every saved section; request a target of three questions.
 - `/questions` — review the first page of pending questions.
 - `/questions pending 2` — review the second page of pending questions.
@@ -70,7 +79,9 @@ when a scheduled time arrives, nothing is published.
 The requested question count is a target. If the document has more sections than
 the target, the bot still checks every section and may create more questions so
 relevant later sections are not ignored. Sections with no supported quiz question
-are counted and reported rather than silently omitted.
+are counted and reported rather than silently omitted. Generation is on-demand;
+`/generate` defaults to ten drafts, while `/schedule` continues to control only
+the publication of questions that an administrator has approved.
 
 ## Question review
 
@@ -92,20 +103,25 @@ Manba: fayl_nomi.pdf | 3-modda
 Iqtibos: manbadan aynan olingan jumla
 ```
 
-The source reference and quote must still match an uploaded source. If the
+The source reference and quote must still match the uploaded excerpt. If the
 document has no article or section labels, the bot uses extracted page,
-paragraph, or line markers rather than inventing a legal citation.
-If a generated reference or quote cannot be verified, the draft is labeled
-**MANBA TEKSHIRILMAGAN**. Its approval button is disabled; edit the citation or
-quote to match the source before approving it.
+paragraph, or line markers rather than inventing a legal citation. If a reference,
+quote, document classification, or Q&A distractor cannot be verified, the draft
+is labeled **NEEDS_REVIEW** and its approval button is disabled. Edit it to match
+the source before approving it.
+
+Q&A extraction recognizes explicit labels such as `Savol:` / `Javob:` or
+`Question:` / `Answer:`. Those original question and answer strings are retained
+in SQLite, and the answer stays the correct option. Distractors not found in the
+document's answer bank are flagged for administrator review.
 
 ## Files
 
 - `bot.py` — Telegram commands, approval buttons, and scheduled publishing.
 - `quiz_generator.py` — PDF/DOCX/TXT extraction and OpenAI question generation.
 - `storage.py` — SQLite persistence.
-- `tests/test_large_documents.py` — offline coverage, citation, deduplication,
-  and collection tests.
+- `tests/test_large_documents.py` — offline chunking, Q&A preservation, citation,
+  retry/repair, deduplication, migration, and approval-gate tests.
 - `requirements.txt` — Python dependencies.
 
 The SQLite database is created automatically next to the bot code as

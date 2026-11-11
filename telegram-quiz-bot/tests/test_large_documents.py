@@ -16,8 +16,12 @@ sys.path.insert(0, str(BOT_DIR))
 
 import storage
 from quiz_generator import (
+    SectionProcessingError,
+    build_source_sections,
+    classify_document,
     chunk_document,
     extract_document,
+    extract_question_answer_pairs,
     generate_questions,
     is_near_duplicate,
     prepare_plain_text,
@@ -76,6 +80,51 @@ class LargeDocumentTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(prepared), 45_000)
         self.assertGreater(len(extracted), 45_000)
         self.assertIn("[Line 2000]", extracted)
+
+    def test_question_answer_documents_keep_original_pairs_and_full_coverage(self):
+        source_text = (
+            "[Paragraph 1]\n"
+            "Savol: Birinchi savol nima?\n"
+            "Javob: Birinchi aniq javob.\n\n"
+            "[Paragraph 2]\n"
+            "Savol: Ikkinchi savol nima?\n"
+            "Javob: Ikkinchi aniq javob."
+        )
+
+        pairs = extract_question_answer_pairs(source_text)
+        document_type, sections = build_source_sections(
+            "qa.txt", source_text, source_id=9
+        )
+
+        self.assertEqual(document_type, "question_answer")
+        self.assertEqual(classify_document(source_text), "question_answer")
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0]["question"], "Birinchi savol nima?")
+        self.assertEqual(pairs[0]["answer"], "Birinchi aniq javob.")
+        self.assertEqual("".join(section["source_excerpt"] for section in sections), source_text)
+        self.assertEqual(sections[0]["source_reference"], "[Paragraph 1]")
+
+    def test_normative_legal_documents_are_classified_separately(self):
+        self.assertEqual(
+            classify_document("[Page 1]\n3-modda. Huquqiy norma matni."),
+            "normative_legal",
+        )
+
+    def test_mixed_qa_and_legal_text_keeps_both_sections(self):
+        source_text = (
+            "[Paragraph 1]\nSavol: Qonun qachon qabul qilindi?\n"
+            "Javob: 2020-yilda.\n"
+            "3-modda. Alohida normativ qoida."
+        )
+        document_type, sections = build_source_sections("mixed.txt", source_text)
+        self.assertEqual(document_type, "mixed")
+        self.assertEqual(
+            "".join(section["source_excerpt"] for section in sections), source_text
+        )
+        self.assertEqual(
+            [section["section_kind"] for section in sections],
+            ["question_answer", "prose"],
+        )
 
     def test_large_docx_and_pdf_extraction_are_not_limited_by_text_length(self):
         document = Document()
@@ -142,6 +191,7 @@ class LargeDocumentTests(unittest.IsolatedAsyncioTestCase):
             {item["source_title"] for item in result["questions"]},
             {"alpha.txt", "bravo.txt"},
         )
+        self.assertTrue(all(item["source_excerpt"] for item in result["questions"]))
 
     async def test_unverified_reference_is_flagged_instead_of_discarded(self):
         source = {
@@ -183,6 +233,7 @@ class LargeDocumentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["questions"]), 1)
         self.assertFalse(result["questions"][0]["source_verified"])
         self.assertEqual(result["source_unverified"], 1)
+        self.assertEqual(result["questions"][0]["review_status"], "NEEDS_REVIEW")
 
     async def test_rate_limits_and_timeouts_are_retried(self):
         response = SimpleNamespace(
@@ -210,6 +261,235 @@ class LargeDocumentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(client.chat.completions.create.await_count, 3)
         self.assertEqual(sleep.await_count, 2)
+
+    async def test_qa_generation_preserves_source_question_and_answer(self):
+        class QaCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                prompt = kwargs["messages"][-1]["content"]
+                answer = prompt.split("ASL TO‘G‘RI JAVOB: ", 1)[1].splitlines()[0]
+                bank = json.loads(
+                    prompt.split("JAVOBLAR BANKI:\n", 1)[1].splitlines()[0]
+                )
+                distractors = [item for item in bank if item != answer][:3]
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps({"distractors": distractors})
+                            )
+                        )
+                    ]
+                )
+
+        pairs = [
+            ("Suv qaynash nuqtasi qanchaga teng?", "100 daraja"),
+            ("Yer qaysi yulduz atrofida aylanadi?", "Quyosh"),
+            ("O‘zbekistonning poytaxti qaysi?", "Toshkent"),
+            ("Bir haftada necha kun bor?", "Yetti kun"),
+        ]
+        qa_text = "\n\n".join(
+            f"[Paragraph {index}]\nSavol: {question}\nJavob: {answer}"
+            for index, (question, answer) in enumerate(pairs, start=1)
+        )
+        client = FakeClient()
+        client.completions = QaCompletions()
+        client.chat = SimpleNamespace(completions=client.completions)
+
+        result = await generate_questions(
+            client,
+            [{"id": 9, "title": "qa.txt", "content": qa_text}],
+            count=10,
+        )
+
+        self.assertEqual(client.completions.calls, 4)
+        self.assertEqual(len(result["questions"]), 4)
+        first = result["questions"][0]
+        self.assertEqual(first["question"], "Suv qaynash nuqtasi qanchaga teng?")
+        self.assertEqual(first["options"][first["correct_index"]], "100 daraja")
+        self.assertEqual(first["original_question"], first["question"])
+        self.assertEqual(first["original_answer"], first["options"][first["correct_index"]])
+        self.assertIn(first["original_answer"], first["source_quote"])
+        self.assertIn("Savol: Suv qaynash nuqtasi qanchaga teng?", first["source_excerpt"])
+        self.assertEqual(first["review_status"], "READY_FOR_APPROVAL")
+
+    async def test_ungrounded_qa_distractors_require_review(self):
+        class UnsupportedDistractors:
+            async def create(self, **kwargs):
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "distractors": [
+                                            "Uydirma javob bir",
+                                            "Uydirma javob ikki",
+                                            "Uydirma javob uch",
+                                        ]
+                                    }
+                                )
+                            )
+                        )
+                    ]
+                )
+
+        client = FakeClient()
+        client.chat = SimpleNamespace(
+            completions=UnsupportedDistractors()
+        )
+        result = await generate_questions(
+            client,
+            [
+                {
+                    "id": 15,
+                    "title": "single-qa.txt",
+                    "content": (
+                        "[Paragraph 1]\nSavol: Asosiy javob nima?\n"
+                        "Javob: Manbada aniq javob."
+                    ),
+                }
+            ],
+            count=1,
+        )
+
+        question = result["questions"][0]
+        self.assertTrue(question["source_verified"])
+        self.assertEqual(question["review_status"], "NEEDS_REVIEW")
+        self.assertIn("distractor", question["source_review_note"])
+
+    async def test_invalid_ai_shape_gets_one_safe_repair_attempt(self):
+        class RepairCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    result = {
+                        "questions": [
+                            {
+                                "question": "What rule is stated?",
+                                "options": ["A", "B"],
+                                "correct_index": 0,
+                                "source_reference": "1-modda",
+                                "source_quote": "The exact source rule is stated here.",
+                            }
+                        ]
+                    }
+                else:
+                    result = {
+                        "questions": [
+                            {
+                                "question": "What rule is stated?",
+                                "options": ["A", "B", "C", "D"],
+                                "correct_index": 0,
+                                "source_reference": "1-modda",
+                                "source_quote": "The exact source rule is stated here.",
+                            }
+                        ]
+                    }
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=json.dumps(result))
+                        )
+                    ]
+                )
+
+        client = FakeClient()
+        client.completions = RepairCompletions()
+        client.chat = SimpleNamespace(completions=client.completions)
+        result = await generate_questions(
+            client,
+            [
+                {
+                    "id": 1,
+                    "title": "law.txt",
+                    "content": "[Page 1]\n1-modda. The exact source rule is stated here.",
+                }
+            ],
+            count=1,
+        )
+
+        self.assertEqual(client.completions.calls, 2)
+        self.assertEqual(len(result["questions"]), 1)
+        self.assertEqual(result["questions"][0]["review_status"], "READY_FOR_APPROVAL")
+
+    async def test_second_invalid_ai_shape_stops_without_saving_partial_results(self):
+        class AlwaysInvalid:
+            def __init__(self):
+                self.calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "questions": [
+                                            {
+                                                "question": "Question?",
+                                                "options": ["A", "B"],
+                                                "correct_index": 0,
+                                                "source_reference": "1-modda",
+                                                "source_quote": "A sufficiently long source quote.",
+                                            }
+                                        ]
+                                    }
+                                )
+                            )
+                        )
+                    ]
+                )
+
+        client = FakeClient()
+        client.completions = AlwaysInvalid()
+        client.chat = SimpleNamespace(completions=client.completions)
+        with self.assertRaises(SectionProcessingError) as raised:
+            await generate_questions(
+                client,
+                [
+                    {
+                        "id": 1,
+                        "title": "law.txt",
+                        "content": "[Page 1]\n1-modda. A sufficiently long source quote.",
+                    }
+                ],
+                count=1,
+            )
+
+        self.assertEqual(client.completions.calls, 2)
+        self.assertEqual(raised.exception.sections_processed, 0)
+        self.assertEqual(raised.exception.sections_total, 1)
+
+    async def test_section_error_stops_processing_and_reports_completed_sections(self):
+        sources = [
+            {"id": 1, "title": "first.txt", "content": "[Page 1]\n1-modda. First."},
+            {"id": 2, "title": "second.txt", "content": "[Page 1]\n2-modda. Second."},
+            {"id": 3, "title": "third.txt", "content": "[Page 1]\n3-modda. Third."},
+        ]
+
+        async def fail_on_second_section(client, section, count, answer_bank=None):
+            if section["source_title"] == "second.txt":
+                raise APITimeoutError(request=SimpleNamespace())
+            return []
+
+        with patch(
+            "quiz_generator._generate_for_section",
+            side_effect=fail_on_second_section,
+        ):
+            with self.assertRaises(SectionProcessingError) as raised:
+                await generate_questions(FakeClient(), sources, count=1)
+
+        self.assertEqual(raised.exception.section_number, 2)
+        self.assertEqual(raised.exception.sections_processed, 1)
+        self.assertEqual(raised.exception.sections_total, 3)
 
     def test_near_duplicate_question_detection(self):
         original = "Qonunning 3-moddasida qaysi qoida belgilangan?"
@@ -253,6 +533,9 @@ class StorageCollectionTests(unittest.TestCase):
                 "source_ids": [source_id],
                 "source_verified": False,
                 "source_review_note": "Reference not found.",
+                "source_excerpt": "[Page 1]\n1-modda. The cited legal rule appears here.",
+                "document_type": "normative_legal",
+                "review_status": "NEEDS_REVIEW",
             }
         ]
 
@@ -268,8 +551,40 @@ class StorageCollectionTests(unittest.TestCase):
         self.assertEqual(saved["generation_run_id"], run_id)
         self.assertEqual(saved["status"], "pending")
         self.assertFalse(saved["source_verified"])
+        self.assertEqual(saved["review_status"], "NEEDS_REVIEW")
+        self.assertEqual(
+            saved["source_excerpt"],
+            "[Page 1]\n1-modda. The cited legal rule appears here.",
+        )
         self.assertFalse(storage.set_question_status(question_ids[0], "approved"))
         self.assertTrue(storage.set_question_status(question_ids[0], "rejected"))
+
+    def test_approval_requires_ready_review_state_even_when_source_matches(self):
+        question_id = storage.add_question(
+            question="Which rule is stated?",
+            options=["A", "B", "C", "D"],
+            correct_index=0,
+            source_title="law.txt",
+            source_reference="1-modda",
+            source_quote="The source quote.",
+            source_ids=[],
+            source_verified=True,
+            review_status="NEEDS_REVIEW",
+        )
+        self.assertFalse(storage.set_question_status(question_id, "approved"))
+
+        ready_id = storage.add_question(
+            question="Which rule is stated?",
+            options=["A", "B", "C", "D"],
+            correct_index=0,
+            source_title="law.txt",
+            source_reference="1-modda",
+            source_quote="The source quote.",
+            source_ids=[],
+            source_verified=True,
+            review_status="READY_FOR_APPROVAL",
+        )
+        self.assertTrue(storage.set_question_status(ready_id, "approved"))
 
     def test_pending_questions_can_be_reviewed_in_pages(self):
         for index in range(25):
@@ -292,6 +607,20 @@ class StorageCollectionTests(unittest.TestCase):
         storage.DB_PATH = Path(self.temp_dir.name) / "legacy.sqlite3"
         try:
             with sqlite3.connect(storage.DB_PATH) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE generation_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_count INTEGER NOT NULL,
+                        sections_total INTEGER NOT NULL,
+                        sections_processed INTEGER NOT NULL,
+                        question_count INTEGER NOT NULL,
+                        duplicates_removed INTEGER NOT NULL DEFAULT 0,
+                        unverified_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
                 connection.execute(
                     """
                     CREATE TABLE questions (
@@ -335,6 +664,16 @@ class StorageCollectionTests(unittest.TestCase):
             migrated = storage.get_question(1)
             self.assertTrue(migrated["source_verified"])
             self.assertIsNone(migrated["generation_run_id"])
+            self.assertEqual(migrated["review_status"], "NEEDS_REVIEW")
+            self.assertEqual(migrated["source_excerpt"], "")
+            with sqlite3.connect(storage.DB_PATH) as connection:
+                run_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(generation_runs)"
+                    )
+                }
+            self.assertIn("needs_review_count", run_columns)
         finally:
             storage.DB_PATH = original_path
 

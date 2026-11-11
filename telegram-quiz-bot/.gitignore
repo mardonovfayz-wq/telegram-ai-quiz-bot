@@ -4,3 +4,36 @@ quiz_bot.sqlite3
 quiz_bot.sqlite3-shm
 quiz_bot.sqlite3-wal
 .env
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Uploaded documents
+uploads/
+documents/
+
+# Generated and temporary files
+generated/
+temp/
+tmp/
+*.tmp
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Private files
+secrets/

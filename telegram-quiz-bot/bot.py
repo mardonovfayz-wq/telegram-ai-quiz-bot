@@ -63,7 +63,7 @@ HELP_TEXT = (
     "Telegram AI Quiz Bot buyruqlari:\n"
     "/start — botni boshlash\n"
     "/upload — PDF, DOCX, TXT yoki oddiy matn yuborish rejimi\n"
-    "/generate [son] — manbalardan savollar yaratish (standart: 5)\n"
+    "/generate [son] — manbalardan savollar yaratish (standart: 10)\n"
     "/questions [holat] [sahifa] — savollarni ko‘rish\n"
     "/schedule — nashr vaqtlarini ko‘rish yoki sozlash\n"
     "/help — yordam\n\n"
@@ -161,7 +161,7 @@ async def handle_document(
         context.user_data["awaiting_upload"] = False
         await update.effective_message.reply_text(
             f"Manba saqlandi: {filename} (ID: {source_id}).\n"
-            "Savollar yaratish uchun /generate yoki /generate 5 buyrug‘ini yuboring."
+            "Savollar yaratish uchun /generate yoki /generate 10 buyrug‘ini yuboring."
         )
     except ValueError as error:
         await update.effective_message.reply_text(str(error))
@@ -197,7 +197,7 @@ async def handle_text(
             context.user_data["awaiting_upload"] = False
             await message.reply_text(
                 f"Matn manba sifatida saqlandi (ID: {source_id}).\n"
-                "Savollar yaratish uchun /generate yoki /generate 5 buyrug‘ini yuboring."
+                "Savollar yaratish uchun /generate yoki /generate 10 buyrug‘ini yuboring."
             )
         except ValueError as error:
             await message.reply_text(str(error))
@@ -215,7 +215,7 @@ async def generate_command(
         await update.effective_message.reply_text("Foydalanish: /generate [son]")
         return
     try:
-        count = int(context.args[0]) if context.args else 5
+        count = int(context.args[0]) if context.args else 10
     except ValueError:
         await update.effective_message.reply_text("Savollar sonini raqam bilan kiriting.")
         return
@@ -250,6 +250,16 @@ async def generate_command(
             questions=questions,
             duplicates_removed=result["duplicates_removed"],
         )
+        type_names = {
+            "question_answer": "savol-javob",
+            "normative_legal": "normativ-huquqiy",
+            "mixed": "aralash",
+            "general": "umumiy",
+        }
+        type_summary = ", ".join(
+            f"{type_names.get(name, name)}: {amount}"
+            for name, amount in result["document_type_counts"].items()
+        )
         delivery_failures = 0
         for card_number, question_id in enumerate(question_ids, start=1):
             try:
@@ -275,7 +285,7 @@ async def generate_command(
                     logger.info("Could not update card-delivery progress.")
         delivery_note = (
             f"\nYuborilmagan kartalar: {delivery_failures}. "
-            "Ularni /questions pending orqali ko‘ring."
+            "Ularni /questions pending [sahifa] orqali ko‘ring."
             if delivery_failures
             else ""
         )
@@ -284,11 +294,15 @@ async def generate_command(
                 f"To‘plam #{run_id} SQLite’da saqlandi.\n"
                 f"Bo‘limlar qayta ishlandi: "
                 f"{result['sections_processed']}/{result['sections_total']}\n"
+                f"Hujjat turlari: {type_summary}\n"
                 f"Qoralama savollar: {len(questions)}\n"
                 f"Yetarli dalil topilmagan bo‘limlar: "
                 f"{result['sections_without_questions']}\n"
                 f"Takroriy savollar olib tashlandi: {result['duplicates_removed']}\n"
-                f"Manbasi tekshirilmagan qoralamalar: {result['source_unverified']}\n\n"
+                f"Tasdiqlashga tayyor qoralamalar: "
+                f"{result['ready_for_approval']}\n"
+                f"Manbasi tekshirilmagan qoralamalar: {result['source_unverified']}\n"
+                f"NEEDS_REVIEW holatidagi qoralamalar: {result['needs_review']}\n\n"
                 "Har bir savol administrator tomonidan tasdiqlanmaguncha "
                 f"kanalga chiqmaydi.{delivery_note}"
             )
@@ -323,17 +337,38 @@ def format_question(question: dict) -> str:
     )
     correct = letters[question["correct_index"]]
     verification_note = ""
-    if not question["source_verified"]:
+    review_status = question.get("review_status", "NEEDS_REVIEW")
+    if review_status == "NEEDS_REVIEW":
         verification_note = (
-            "\n\nOGOHLANTIRISH: MANBA TEKSHIRILMAGAN\n"
-            f"{question['source_review_note'] or 'Havola va iqtibosni tekshiring.'}"
+            "\n\nNEEDS_REVIEW: administrator tekshiruvi shart.\n"
+            f"{question.get('source_review_note') or 'Manbani tekshiring.'}"
+        )
+    source_excerpt = question.get("source_excerpt", "")
+    excerpt_preview = source_excerpt[:500]
+    if len(source_excerpt) > 500:
+        excerpt_preview += "… [to‘liq parcha SQLite’da saqlangan]"
+    source_quote = question.get("source_quote", "")
+    quote_preview = source_quote[:500]
+    if len(source_quote) > 500:
+        quote_preview += "… [to‘liq iqtibos SQLite’da saqlangan]"
+    excerpt_block = ""
+    if source_excerpt and source_excerpt.strip() != source_quote.strip():
+        excerpt_block = f"\nManba parchasi: {excerpt_preview}"
+    original_pair = ""
+    if question.get("original_question"):
+        original_pair = (
+            "\nAsl savol-javob saqlangan:\n"
+            f"Savol: {question['original_question']}\n"
+            f"Javob: {question['original_answer']}\n"
         )
     return (
-        f"#{question['id']} · Holat: {question['status']}\n\n"
+        f"#{question['id']} · Holat: {question['status']} · "
+        f"{review_status}\n"
+        f"Hujjat turi: {question.get('document_type', 'unknown')}\n\n"
         f"{question['question']}\n\n{options}\n\n"
         f"To‘g‘ri javob: {correct}) {question['options'][question['correct_index']]}\n"
         f"Manba: {question['source_title']}, {question['source_reference']}\n"
-        f"Asos: {question['source_quote']}{verification_note}"
+        f"Asos: {quote_preview}{excerpt_block}{original_pair}{verification_note}"
     )
 
 
@@ -344,7 +379,10 @@ async def send_question_card(
     if not question:
         return
     buttons = []
-    if question["source_verified"]:
+    if (
+        question["source_verified"]
+        and question.get("review_status") == "READY_FOR_APPROVAL"
+    ):
         buttons.append(
             InlineKeyboardButton("Tasdiqlash", callback_data=f"approve:{question_id}")
         )
@@ -437,9 +475,12 @@ async def question_action(
         return
 
     if action == "approve":
-        if not question["source_verified"]:
+        if (
+            not question["source_verified"]
+            or question.get("review_status") != "READY_FOR_APPROVAL"
+        ):
             await query.answer(
-                "Manba hali tekshirilmagan. Avval havola va iqtibosni tahrirlang.",
+                "Savol tasdiqlashga tayyor emas. Avval manba va mazmunni tahrirlang.",
                 show_alert=True,
             )
             return
@@ -549,12 +590,18 @@ async def save_edited_question(
             edited["source_reference"],
             edited["source_quote"],
             sources,
+            section_text=old_question["source_excerpt"]
+            if old_question.get("source_excerpt")
+            else None,
         )
         if len(edited["source_reference"]) > 190:
             verified = False
             review_note = "Havola juda uzun; qisqaroq aniq huquqiy havolani kiriting."
         edited["source_verified"] = verified
         edited["source_review_note"] = review_note
+        edited["review_status"] = (
+            "READY_FOR_APPROVAL" if verified else "NEEDS_REVIEW"
+        )
         updated = storage.update_question(question_id, **edited)
         if not updated:
             raise ValueError("Savol holati o‘zgargan; tahrir saqlanmadi.")
